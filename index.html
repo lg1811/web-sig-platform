@@ -1,0 +1,242 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>GeoWebSIG – Plataforma Web de Visualização de Geodados</title>
+  <meta name="description" content="Plataforma Web SIG para visualização de Shapefiles, GeoJSON e GeoTIFF diretamente no navegador, sem instalação de software." />
+  <meta name="keywords" content="GIS, SIG, Shapefile, GeoJSON, GeoTIFF, Leaflet, Web GIS, QGIS alternativa" />
+  <meta name="author" content="Leticia" />
+
+  <!-- Open Graph -->
+  <meta property="og:title" content="GeoWebSIG – Plataforma Web de Visualização de Geodados" />
+  <meta property="og:description" content="Visualize arquivos geográficos (Shapefile, GeoJSON, GeoTIFF) diretamente no navegador." />
+  <meta property="og:type" content="website" />
+
+  <!-- Leaflet CSS -->
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" crossorigin="" />
+
+  <!-- Google Fonts -->
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet" />
+
+  <!-- App CSS -->
+  <link rel="stylesheet" href="css/style.css" />
+</head>
+<body>
+
+  <!-- ============================================================ APP WRAPPER -->
+  <div id="app">
+
+    <!-- ========== SIDEBAR ========== -->
+    <aside id="sidebar" class="sidebar">
+      <div class="sidebar-header">
+        <div class="logo">
+          <svg class="logo-icon" viewBox="0 0 32 32" fill="none">
+            <circle cx="16" cy="16" r="15" stroke="#4f8ef7" stroke-width="2"/>
+            <ellipse cx="16" cy="16" rx="6" ry="15" stroke="#4f8ef7" stroke-width="1.5"/>
+            <line x1="1" y1="16" x2="31" y2="16" stroke="#4f8ef7" stroke-width="1.5"/>
+            <path d="M4 10 Q16 8 28 10" stroke="#4f8ef7" stroke-width="1.2" fill="none" opacity="0.6"/>
+            <path d="M4 22 Q16 24 28 22" stroke="#4f8ef7" stroke-width="1.2" fill="none" opacity="0.6"/>
+            <circle cx="16" cy="16" r="3" fill="#4f8ef7" opacity="0.8"/>
+          </svg>
+          <div class="logo-text">
+            <span class="logo-name">GeoWebSIG</span>
+            <span class="logo-sub">Plataforma Web SIG</span>
+          </div>
+        </div>
+        <button id="btn-toggle-sidebar" class="btn-icon" title="Recolher painel">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M15 18l-6-6 6-6"/></svg>
+        </button>
+      </div>
+
+      <!-- UPLOAD ZONE -->
+      <div class="sidebar-section">
+        <div id="drop-zone" class="drop-zone" title="Arraste arquivos SHP, GeoJSON ou GeoTIFF aqui">
+          <div class="drop-zone-inner">
+            <svg class="drop-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
+              <path d="M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4"/>
+              <polyline points="17 8 12 3 7 8"/>
+              <line x1="12" y1="3" x2="12" y2="15"/>
+            </svg>
+            <p class="drop-title">Adicionar Camada</p>
+            <p class="drop-sub">Arraste ou clique para carregar</p>
+            <p class="drop-formats">.shp · .geojson · .tif</p>
+          </div>
+          <input type="file" id="file-input" class="file-input" multiple
+            accept=".shp,.dbf,.prj,.geojson,.json,.tif,.tiff" />
+        </div>
+        <div id="upload-progress" class="upload-progress hidden">
+          <div class="progress-bar"><div class="progress-fill" id="progress-fill"></div></div>
+          <span class="progress-label" id="progress-label">Carregando...</span>
+        </div>
+      </div>
+
+      <!-- LAYER MANAGER -->
+      <div class="sidebar-section">
+        <div class="section-header">
+          <h2 class="section-title">Camadas</h2>
+          <div class="layer-actions">
+            <button id="btn-sample-data" class="btn-sm btn-accent" title="Carregar dados de exemplo">
+              <svg viewBox="0 0 16 16" fill="currentColor"><path d="M8 0a8 8 0 100 16A8 8 0 008 0zm0 14A6 6 0 118 2a6 6 0 010 12z" opacity=".3"/><path d="M8 2a6 6 0 100 12A6 6 0 008 2zm1 8.5H7v-5l4 2.5-2 2.5z"/></svg>
+              Exemplo
+            </button>
+            <button id="btn-clear-all" class="btn-sm btn-danger" title="Remover todas as camadas">
+              <svg viewBox="0 0 16 16" fill="currentColor"><path d="M6.5 1h3a.5.5 0 01.5.5v1H6v-1a.5.5 0 01.5-.5zM11 2.5v-1A1.5 1.5 0 009.5 0h-3A1.5 1.5 0 005 1.5v1H1.5a.5.5 0 000 1h.538l.853 10.66A2 2 0 004.885 16h6.23a2 2 0 001.994-1.84l.853-10.66H14.5a.5.5 0 000-1H11z"/></svg>
+              Limpar
+            </button>
+          </div>
+        </div>
+        <ul id="layer-list" class="layer-list">
+          <li class="layer-empty" id="layer-empty-msg">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" style="width:32px;height:32px;opacity:0.3;margin-bottom:8px">
+              <polygon points="3 6 9 3 15 6 21 3 21 18 15 21 9 18 3 21"/>
+            </svg>
+            <span>Nenhuma camada carregada</span>
+          </li>
+        </ul>
+      </div>
+
+      <!-- BASE MAP SELECTOR -->
+      <div class="sidebar-section">
+        <div class="section-header">
+          <h2 class="section-title">Mapa Base</h2>
+        </div>
+        <div class="basemap-grid">
+          <button class="basemap-btn active" data-basemap="osm" id="bm-osm">
+            <div class="basemap-thumb osm-thumb"></div>
+            <span>OpenStreetMap</span>
+          </button>
+          <button class="basemap-btn" data-basemap="satellite" id="bm-satellite">
+            <div class="basemap-thumb sat-thumb"></div>
+            <span>Satélite</span>
+          </button>
+          <button class="basemap-btn" data-basemap="dark" id="bm-dark">
+            <div class="basemap-thumb dark-thumb"></div>
+            <span>Dark</span>
+          </button>
+          <button class="basemap-btn" data-basemap="topo" id="bm-topo">
+            <div class="basemap-thumb topo-thumb"></div>
+            <span>Topo</span>
+          </button>
+        </div>
+      </div>
+
+      <!-- INFO BOX -->
+      <div class="sidebar-footer">
+        <div class="info-chip">
+          <svg viewBox="0 0 16 16" fill="currentColor" style="width:12px;height:12px"><path d="M8 0a8 8 0 100 16A8 8 0 008 0zm1 12H7v-4h2v4zm0-6H7V4h2v2z"/></svg>
+          <span>100% client-side · Sem servidor</span>
+        </div>
+        <p class="footer-text">Monografia de Conclusão de Curso<br/>Web SIG · HTML5 + Leaflet.js</p>
+      </div>
+    </aside>
+
+    <!-- ========== MAIN CONTENT ========== -->
+    <main id="main-content" class="main-content">
+
+      <!-- TOOLBAR -->
+      <header id="toolbar" class="toolbar">
+        <button id="btn-open-sidebar" class="btn-icon btn-open-sidebar hidden" title="Abrir painel">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M9 18l6-6-6-6"/></svg>
+        </button>
+        <div class="toolbar-tools">
+          <div class="tool-group">
+            <button id="btn-measure-distance" class="tool-btn" title="Medir Distância (D)">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M2 12h20M2 12l4-4M2 12l4 4M22 12l-4-4M22 12l-4 4"/></svg>
+              <span>Distância</span>
+            </button>
+            <button id="btn-measure-area" class="tool-btn" title="Medir Área (A)">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polygon points="12 2 22 8.5 22 15.5 12 22 2 15.5 2 8.5"/></svg>
+              <span>Área</span>
+            </button>
+            <button id="btn-identify" class="tool-btn" title="Identificar Feição (I)">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><path d="M12 8v4M12 16h.01"/></svg>
+              <span>Atributos</span>
+            </button>
+          </div>
+          <div class="divider-v"></div>
+          <div class="tool-group">
+            <button id="btn-zoom-extent" class="tool-btn" title="Zoom para extensão total (Z)">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="15 3 21 3 21 9"/><polyline points="9 21 3 21 3 15"/><line x1="21" y1="3" x2="14" y2="10"/><line x1="3" y1="21" x2="10" y2="14"/></svg>
+              <span>Extensão</span>
+            </button>
+          </div>
+        </div>
+        <div class="toolbar-status">
+          <div id="tool-status" class="tool-status">
+            <div class="status-dot"></div>
+            <span id="tool-status-text">Pronto</span>
+          </div>
+        </div>
+      </header>
+
+      <!-- MAP -->
+      <div id="map"></div>
+
+      <!-- STATUS BAR -->
+      <div id="status-bar" class="status-bar">
+        <span id="coords-display" class="coords">Lat: –&nbsp;&nbsp;Lng: –</span>
+        <span class="divider-v-sm"></span>
+        <span class="status-crs">EPSG:4326 · WGS 84</span>
+        <span class="divider-v-sm"></span>
+        <span id="layer-count" class="layer-count">0 camadas</span>
+        <span class="divider-v-sm"></span>
+        <span id="measure-result" class="measure-result hidden"></span>
+      </div>
+    </main>
+  </div>
+
+  <!-- ========== ATTRIBUTE MODAL ========== -->
+  <div id="attr-modal" class="modal hidden">
+    <div class="modal-backdrop" id="modal-backdrop"></div>
+    <div class="modal-box">
+      <div class="modal-header">
+        <h3 id="modal-title">Atributos da Feição</h3>
+        <button id="modal-close" class="btn-icon">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
+        </button>
+      </div>
+      <div class="modal-body">
+        <table id="attr-table" class="attr-table">
+          <thead><tr><th>Campo</th><th>Valor</th></tr></thead>
+          <tbody id="attr-table-body"></tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+
+  <!-- ========== TOAST NOTIFICATIONS ========== -->
+  <div id="toast-container" class="toast-container"></div>
+
+  <!-- ========== LOADING OVERLAY ========== -->
+  <div id="loading-overlay" class="loading-overlay hidden">
+    <div class="loading-card">
+      <div class="spinner"></div>
+      <p id="loading-text" class="loading-text">Carregando...</p>
+    </div>
+  </div>
+
+  <!-- =============== SCRIPTS =============== -->
+  <!-- Leaflet JS -->
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js" crossorigin=""></script>
+
+  <!-- Shapefile reader -->
+  <script src="https://cdn.jsdelivr.net/npm/shapefile@0.6.6/dist/shapefile.min.js"></script>
+
+  <!-- Proj4 for coordinate reprojection -->
+  <script src="https://cdn.jsdelivr.net/npm/proj4@2.9.0/dist/proj4.js"></script>
+
+  <!-- GeoRaster for GeoTIFF -->
+  <script src="https://unpkg.com/georaster@1.6.0/dist/georaster.browser.bundle.min.js"></script>
+  <script src="https://unpkg.com/georaster-layer-for-leaflet@3.10.0/dist/georaster-layer-for-leaflet.min.js"></script>
+
+  <!-- App Scripts -->
+  <script src="js/sampleData.js"></script>
+  <script src="js/app.js"></script>
+  <script src="js/layerManager.js"></script>
+  <script src="js/fileLoader.js"></script>
+  <script src="js/mapTools.js"></script>
+</body>
+</html>
