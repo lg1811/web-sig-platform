@@ -62,20 +62,29 @@ const LayerManager = (() => {
   function onEachFeature(feature, layer, layerColor) {
     layer.on({
       mouseover(e) {
-        if (AppState.activeTool === 'identify') return;
+        if (AppState.activeTool === 'measure-distance' || AppState.activeTool === 'measure-area') return;
         const l = e.target;
         if (l.setStyle) l.setStyle(highlightStyle(feature, layerColor));
         if (l.bringToFront) l.bringToFront();
       },
       mouseout(e) {
-        if (AppState.activeTool === 'identify') return;
+        if (AppState.activeTool === 'measure-distance' || AppState.activeTool === 'measure-area') return;
         const l = e.target;
         if (l.setStyle) l.setStyle(polygonStyle(feature, layerColor));
       },
       click(e) {
+        /* Stop event from bubbling to map (prevents measurement tool conflicts) */
+        L.DomEvent.stopPropagation(e);
+
         if (AppState.activeTool === 'measure-distance' || AppState.activeTool === 'measure-area') return;
-        if (feature.properties && Object.keys(feature.properties).length > 0) {
-          showAttributeModal(feature.properties, feature.geometry?.type || 'Feature');
+
+        try {
+          const props = feature.properties || {};
+          const geomType = (feature.geometry && feature.geometry.type) ? feature.geometry.type : 'Feature';
+          showAttributeModal(props, geomType);
+        } catch (err) {
+          console.error('[LayerManager] Erro ao abrir atributos:', err);
+          showToast('Erro ao exibir atributos da feição.', 'error');
         }
       }
     });
@@ -329,16 +338,41 @@ function showAttributeModal(properties, geomType) {
   const title = document.getElementById('modal-title');
   const tbody = document.getElementById('attr-table-body');
 
+  if (!modal || !title || !tbody) {
+    console.error('[showAttributeModal] Elementos do modal não encontrados no DOM.');
+    return;
+  }
+
   title.textContent = `Atributos · ${geomType}`;
   tbody.innerHTML = '';
 
-  Object.entries(properties).forEach(([key, val]) => {
+  const entries = properties ? Object.entries(properties) : [];
+
+  if (entries.length === 0) {
     const tr = document.createElement('tr');
-    const displayVal = val === null || val === undefined ? '<span style="color:var(--text-muted);font-style:italic">nulo</span>' :
-      typeof val === 'number' ? val.toLocaleString('pt-BR') : String(val);
-    tr.innerHTML = `<td>${key}</td><td>${displayVal}</td>`;
+    tr.innerHTML = `<td colspan="2" style="text-align:center;color:var(--text-muted);font-style:italic;padding:20px">Sem atributos</td>`;
     tbody.appendChild(tr);
-  });
+  } else {
+    entries.forEach(([key, val]) => {
+      const tr = document.createElement('tr');
+      let displayVal;
+      if (val === null || val === undefined) {
+        displayVal = '<span style="color:var(--text-muted);font-style:italic">nulo</span>';
+      } else if (typeof val === 'number') {
+        displayVal = val.toLocaleString('pt-BR');
+      } else if (typeof val === 'object') {
+        displayVal = `<code style="font-size:10px">${JSON.stringify(val)}</code>`;
+      } else {
+        /* Escape HTML to prevent XSS from attribute values */
+        displayVal = String(val)
+          .replace(/&/g, '&amp;')
+          .replace(/</g, '&lt;')
+          .replace(/>/g, '&gt;');
+      }
+      tr.innerHTML = `<td>${key}</td><td>${displayVal}</td>`;
+      tbody.appendChild(tr);
+    });
+  }
 
   modal.classList.remove('hidden');
 }

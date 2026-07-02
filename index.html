@@ -62,10 +62,10 @@
             </svg>
             <p class="drop-title">Adicionar Camada</p>
             <p class="drop-sub">Arraste ou clique para carregar</p>
-            <p class="drop-formats">.shp · .geojson · .tif</p>
+            <p class="drop-formats">.shp · .geojson · .tif · .gpkg</p>
           </div>
           <input type="file" id="file-input" class="file-input" multiple
-            accept=".shp,.dbf,.prj,.geojson,.json,.tif,.tiff" />
+            accept=".shp,.dbf,.prj,.geojson,.json,.tif,.tiff,.gpkg" />
         </div>
         <div id="upload-progress" class="upload-progress hidden">
           <div class="progress-bar"><div class="progress-fill" id="progress-fill"></div></div>
@@ -231,6 +231,13 @@
   <!-- GeoRaster for GeoTIFF -->
   <script src="https://unpkg.com/georaster@1.6.0/dist/georaster.browser.bundle.min.js"></script>
   <script src="https://unpkg.com/georaster-layer-for-leaflet@3.10.0/dist/georaster-layer-for-leaflet.min.js"></script>
+
+  <!-- sql.js for GeoPackage (SQLite in the browser) -->
+  <script>
+    /* Configure sql.js WASM path before loading */
+    window.SQL_JS_WASM_URL = 'https://cdnjs.cloudflare.com/ajax/libs/sql.js/1.10.2/sql-wasm.wasm';
+  </script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/sql.js/1.10.2/sql-wasm.min.js"></script>
 
   <!-- App Scripts -->
   <script src="js/sampleData.js"></script>
