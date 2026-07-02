@@ -132,7 +132,6 @@ const FileLoader = (() => {
             const wgs84 = proj4('WGS84');
             geojson.features = features.map(f => reprojectFeature(f, srcProj, wgs84));
           } catch (projErr) {
-            /* If reprojection fails, use as-is */
             console.warn('Reprojection skipped:', projErr.message);
           }
         }
@@ -167,51 +166,87 @@ const FileLoader = (() => {
     return { ...geom, coordinates: transform(geom.coordinates) };
   }
 
-  /* ── GeoPackage WKB Parser ──
-     Implements ISO WKB + Extended WKB (EWKB) + WKB Z/M variants
-     and GeoPackage geometry blob header (GP header + optional envelope)
-  */
+  /* ── GeoTIFF Loader ── */
+  async function loadGeoTIFF(file) {
+    if (typeof parseGeoraster === 'undefined' || typeof GeoRasterLayer === 'undefined') {
+      throw new Error('Biblioteca GeoRaster não carregada. Verifique a conexão à internet.');
+    }
 
-  /* Read a WKB geometry from a DataView at a given position.
-     `state` is a shared mutable object { pos, le } that tracks position. */
+    const { prog, fill, lbl } = showProgress('Lendo GeoTIFF...');
+    setProgress(fill, lbl, 25, 'Decodificando pixels...');
+
+    const arrayBuffer = await file.arrayBuffer();
+    setProgress(fill, lbl, 55, 'Processando raster...');
+
+    let georaster;
+    try {
+      georaster = await parseGeoraster(arrayBuffer);
+    } catch (e) {
+      hideProgress(prog);
+      throw new Error('Erro ao decodificar GeoTIFF: ' + e.message);
+    }
+
+    setProgress(fill, lbl, 85, 'Renderizando no mapa...');
+    const name = baseName(file.name);
+    LayerManager.addGeoTIFFLayer(georaster, name);
+
+    setProgress(fill, lbl, 100, 'GeoTIFF renderizado!');
+    hideProgress(prog);
+
+    const bands = georaster.numberOfRasters || 1;
+    const w = georaster.width || '?';
+    const h = georaster.height || '?';
+    showToast(`GeoTIFF "${name}" carregado! ${w}×${h}px · ${bands} banda(s).`, 'success');
+  }
+
+  /* ============================================================
+     GeoPackage (.gpkg) Loader
+     SQLite via sql.js + WKB geometry parser (client-side)
+     Suporta: múltiplas camadas por arquivo, Z/M, EWKB
+     ============================================================ */
+
+  /* ── WKB Geometry Reader ──
+     Receives a DataView and a state object { pos, le }
+     that tracks the current read position (mutated in place).
+     Supports: Point, LineString, Polygon, MultiPoint,
+               MultiLineString, MultiPolygon, GeometryCollection
+     with ISO-WKB Z/M/ZM offsets and EWKB flags.              */
   function _wkbReadGeom(view, state) {
-    /* Byte order */
-    const bo = view.getUint8(state.pos++);
-    state.le = (bo === 1);
+    /* Byte order marker */
+    const bo = view.getUint8(state.pos);
+    state.pos += 1;
+    state.le = (bo === 1); /* 1 = little-endian */
 
     /* Geometry type (uint32) */
     const rawType = view.getUint32(state.pos, state.le);
     state.pos += 4;
 
-    /* Decode type, Z, M flags */
+    /* Decode base type and Z/M presence */
     let baseType = rawType;
     let hasZ = false, hasM = false;
 
-    /* ISO WKB Z/M/ZM offsets */
     if      (rawType > 3000 && rawType < 4000) { hasZ = true;  hasM = true;  baseType = rawType - 3000; }
     else if (rawType > 2000 && rawType < 3000) { hasM = true;  baseType = rawType - 2000; }
     else if (rawType > 1000 && rawType < 2000) { hasZ = true;  baseType = rawType - 1000; }
-    /* EWKB flags (PostGIS style) */
     else {
-      if (rawType & 0x80000000) { hasZ = true; }
-      if (rawType & 0x40000000) { hasM = true; }
+      /* EWKB (PostGIS) flags */
+      if (rawType & 0x80000000) hasZ = true;
+      if (rawType & 0x40000000) hasM = true;
+      if (rawType & 0x20000000) state.pos += 4; /* skip embedded SRID */
       baseType = rawType & 0x0FFFFFFF;
     }
 
-    /* EWKB optional SRID (skip it) */
-    if (rawType & 0x20000000) { state.pos += 4; }
-
     const dims = 2 + (hasZ ? 1 : 0) + (hasM ? 1 : 0);
 
-    /* Read a single coordinate pair [x, y], skipping extra dims */
+    /* Read one coordinate pair [x, y], skipping extra Z/M dimensions */
     function readCoord() {
       const x = view.getFloat64(state.pos, state.le); state.pos += 8;
       const y = view.getFloat64(state.pos, state.le); state.pos += 8;
-      for (let d = 2; d < dims; d++) state.pos += 8; /* skip Z/M */
+      for (let d = 2; d < dims; d++) state.pos += 8; /* skip Z and/or M */
       return [x, y];
     }
 
-    /* Read a ring (array of coords) */
+    /* Read a linear ring: uint32 count + coords */
     function readRing() {
       const n = view.getUint32(state.pos, state.le); state.pos += 4;
       const pts = [];
@@ -219,10 +254,13 @@ const FileLoader = (() => {
       return pts;
     }
 
-    /* Read a nested WKB geometry (sub-geometry in Multi* types) */
-    function readSub() { return _wkbReadGeom(view, state); }
+    /* Recursively read a sub-geometry (used in Multi* and GeometryCollection) */
+    function readSub() {
+      return _wkbReadGeom(view, state);
+    }
 
     switch (baseType) {
+
       case 1: /* Point */
         return { type: 'Point', coordinates: readCoord() };
 
@@ -273,28 +311,36 @@ const FileLoader = (() => {
     }
   }
 
-  /* Parse a GeoPackage geometry blob.
-     Format: 2-byte magic ('GP') + 1 version + 1 flags + 4 SRID + [envelope] + WKB */
+  /* ── Parse GeoPackage Geometry Blob ──
+     GeoPackage Geometry format:
+       Bytes 0-1  : magic 'G','P' (0x47, 0x50)
+       Byte  2    : version (1)
+       Byte  3    : flags
+                      bit 0   = envelope byte-order (0=big, 1=little)
+                      bits 1-3 = envelope type (0=none, 1=xy, 2=xyz, 3=xym, 4=xyzm)
+                      bit 4   = is-empty flag
+       Bytes 4-7  : SRID (int32, in envelope byte-order)
+       Bytes 8+   : optional envelope (4/6/6/8 float64 values)
+       Rest       : standard WKB geometry                        */
   function _parseGpkgGeom(blob) {
-    /* blob is a Uint8Array from sql.js */
     if (!blob || blob.length < 8) return null;
 
+    /* blob is a Uint8Array from sql.js — use its underlying ArrayBuffer with offset */
     const view = new DataView(blob.buffer, blob.byteOffset, blob.byteLength);
 
-    /* Validate magic bytes 'G' 'P' */
+    /* Validate GeoPackage magic bytes */
     if (view.getUint8(0) !== 0x47 || view.getUint8(1) !== 0x50) return null;
 
-    const flags     = view.getUint8(3);
-    const le        = (flags & 0x01) === 1;      /* envelope byte order */
-    const envType   = (flags >> 1) & 0x07;       /* 0=none 1=xy 2=xyz 3=xym 4=xyzm */
-    const isEmpty   = (flags >> 4) & 0x01;
+    const flags    = view.getUint8(3);
+    const envType  = (flags >> 1) & 0x07;  /* 0=none, 1=xy, 2=xyz, 3=xym, 4=xyzm */
+    const isEmpty  = (flags >> 4) & 0x01;
 
     if (isEmpty) return null;
 
-    /* Skip: 2 magic + 1 version + 1 flags + 4 SRID = 8 bytes */
-    /* Then skip envelope doubles */
-    const envDoubles = [0, 4, 6, 6, 8][envType] || 0;
-    const wkbStart  = 8 + envDoubles * 8;
+    /* Calculate WKB start position:
+       8 bytes header + envType doubles (xy=4, xyz=6, xym=6, xyzm=8) */
+    const envDoublesCount = [0, 4, 6, 6, 8][envType] || 0;
+    const wkbStart = 8 + envDoublesCount * 8;
 
     const state = { pos: wkbStart, le: true };
     try {
@@ -307,15 +353,16 @@ const FileLoader = (() => {
 
   /* ── GeoPackage Loader ── */
   async function loadGeoPackage(file) {
-    /* 1. Check sql.js availability */
+
+    /* 1. Check sql.js is available */
     if (typeof initSqlJs === 'undefined') {
       throw new Error('sql.js não carregado. Verifique a conexão à internet e recarregue a página.');
     }
 
     const { prog, fill, lbl } = showProgress('Inicializando leitor GeoPackage...');
-    setProgress(fill, lbl, 10, 'Carregando sql.js (SQLite)...');
+    setProgress(fill, lbl, 8, 'Carregando sql.js (SQLite)...');
 
-    /* 2. Init sql.js – load wasm from CDN */
+    /* 2. Initialise sql.js — loads the .wasm from CDN */
     let SQL;
     try {
       SQL = await initSqlJs({
@@ -326,10 +373,10 @@ const FileLoader = (() => {
       throw new Error('Falha ao inicializar sql.js: ' + e.message);
     }
 
-    setProgress(fill, lbl, 25, 'Lendo arquivo .gpkg...');
+    setProgress(fill, lbl, 20, 'Lendo arquivo .gpkg...');
     const arrayBuffer = await file.arrayBuffer();
 
-    /* 3. Open SQLite database */
+    /* 3. Open the SQLite database */
     let db;
     try {
       db = new SQL.Database(new Uint8Array(arrayBuffer));
@@ -338,100 +385,185 @@ const FileLoader = (() => {
       throw new Error('Arquivo .gpkg inválido ou corrompido: ' + e.message);
     }
 
-    setProgress(fill, lbl, 40, 'Lendo tabelas de feições...');
+    setProgress(fill, lbl, 35, 'Identificando camadas vetoriais...');
 
-    /* 4. Get feature tables from gpkg_contents */
-    let featureTables = [];
+    /* 4. Discover ALL feature tables.
+          Primary:  gpkg_geometry_columns — one row per vector layer, always present.
+          Fallback: gpkg_contents WHERE data_type = 'features'.
+          Using gpkg_geometry_columns as primary ensures we find every layer
+          regardless of how the GeoPackage was created (QGIS, GDAL, ArcGIS, etc.). */
+    let featureTables = []; /* [{ name: string, geomCol: string, label: string }] */
+
     try {
-      const res = db.exec("SELECT table_name, identifier FROM gpkg_contents WHERE data_type = 'features'");
+      /* JOIN with gpkg_contents to get the human-readable identifier/title */
+      const res = db.exec(`
+        SELECT gc.table_name,
+               gc.column_name,
+               COALESCE(c.identifier, gc.table_name) AS label
+        FROM   gpkg_geometry_columns AS gc
+        LEFT JOIN gpkg_contents AS c
+               ON c.table_name = gc.table_name
+        ORDER  BY gc.table_name
+      `);
       if (res.length && res[0].values.length) {
-        featureTables = res[0].values.map(v => ({ name: v[0], label: v[1] || v[0] }));
+        featureTables = res[0].values.map(v => ({
+          name:    v[0],
+          geomCol: v[1],
+          label:   v[2] || v[0],
+        }));
       }
-    } catch (e) {
-      db.close();
-      hideProgress(prog);
-      throw new Error('Não foi possível ler gpkg_contents. Arquivo pode não ser um GeoPackage válido.');
+    } catch (_) {
+      /* Fallback — some non-standard GPKGs may not have gpkg_geometry_columns */
+      try {
+        const res2 = db.exec(
+          "SELECT table_name, table_name FROM gpkg_contents WHERE data_type = 'features'"
+        );
+        if (res2.length && res2[0].values.length) {
+          featureTables = res2[0].values.map(v => ({
+            name: v[0], geomCol: null, label: v[0]
+          }));
+        }
+      } catch (e2) {
+        db.close();
+        hideProgress(prog);
+        throw new Error('Não foi possível ler os metadados do GeoPackage: ' + e2.message);
+      }
     }
 
     if (featureTables.length === 0) {
       db.close();
       hideProgress(prog);
-      throw new Error('Nenhuma tabela de feições encontrada no GeoPackage.');
+      throw new Error('Nenhuma camada vetorial encontrada neste GeoPackage.');
     }
 
-    setProgress(fill, lbl, 55, `${featureTables.length} tabela(s) encontrada(s)...`);
+    setProgress(fill, lbl, 50, `${featureTables.length} camada(s) encontrada(s)...`);
 
     let totalFeatures = 0;
-    let layersAdded  = 0;
+    let layersAdded   = 0;
+    const skipped     = [];
 
-    for (const table of featureTables) {
+    for (let ti = 0; ti < featureTables.length; ti++) {
+      const table = featureTables[ti];
+      const pct = 50 + Math.round(((ti + 1) / featureTables.length) * 45);
+      setProgress(fill, lbl, pct,
+        `Carregando: ${table.label} (${ti + 1}/${featureTables.length})...`);
+
       try {
-        /* 5. Get geometry column name */
-        let geomCol = 'geom';
-        try {
-          const gcRes = db.exec(
-            `SELECT column_name FROM gpkg_geometry_columns WHERE table_name = '${table.name}'`
-          );
-          if (gcRes.length && gcRes[0].values.length) {
-            geomCol = gcRes[0].values[0][0];
-          }
-        } catch (_) { /* fallback to 'geom' */ }
-
-        /* 6. Query all rows from the feature table */
+        /* 5. Fetch all rows from this feature table */
         const rowRes = db.exec(`SELECT * FROM "${table.name}"`);
-        if (!rowRes.length || !rowRes[0].values.length) continue;
+        if (!rowRes.length || !rowRes[0].values.length) {
+          skipped.push(`"${table.label}" — sem feições`);
+          continue;
+        }
 
         const { columns, values } = rowRes[0];
-        const geomIdx = columns.findIndex(c => c.toLowerCase() === geomCol.toLowerCase());
-        if (geomIdx === -1) continue;
 
-        /* 7. Build GeoJSON FeatureCollection */
+        /* 6. Locate the geometry column index.
+              Priority:
+              a) Name provided by gpkg_geometry_columns (most reliable).
+              b) Case-insensitive match against common geometry column names.
+              c) Auto-detect by scanning for Uint8Array with GeoPackage magic bytes. */
+        let geomIdx = -1;
+
+        if (table.geomCol) {
+          geomIdx = columns.findIndex(c => c.toLowerCase() === table.geomCol.toLowerCase());
+        }
+
+        if (geomIdx === -1) {
+          const commonNames = ['geom', 'geometry', 'the_geom', 'wkb_geometry', 'shape', 'geom_col', 'wkt_geometry'];
+          for (const cname of commonNames) {
+            const idx = columns.findIndex(c => c.toLowerCase() === cname);
+            if (idx !== -1) { geomIdx = idx; break; }
+          }
+        }
+
+        if (geomIdx === -1) {
+          /* Auto-detect: find first blob column with GeoPackage magic bytes 'G','P' */
+          const firstRow = values[0];
+          for (let ci = 0; ci < firstRow.length; ci++) {
+            const v = firstRow[ci];
+            if (v instanceof Uint8Array && v.length > 8 &&
+                v[0] === 0x47 && v[1] === 0x50) {
+              geomIdx = ci;
+              break;
+            }
+          }
+        }
+
+        if (geomIdx === -1) {
+          skipped.push(`"${table.label}" — coluna de geometria não encontrada`);
+          continue;
+        }
+
+        /* 7. Parse each row → GeoJSON Feature */
         const features = [];
+        let parseErrCount = 0;
+
         for (const row of values) {
           const geomBlob = row[geomIdx];
           if (!geomBlob) continue;
 
+          /* Ensure we have a Uint8Array */
+          const blobUint8 = geomBlob instanceof Uint8Array
+            ? geomBlob
+            : new Uint8Array(geomBlob);
+
           let geometry;
           try {
-            geometry = _parseGpkgGeom(geomBlob);
+            geometry = _parseGpkgGeom(blobUint8);
           } catch (e) {
-            continue; /* skip unparseable geometry */
+            parseErrCount++;
+            continue;
           }
-          if (!geometry) continue;
+          if (!geometry) { parseErrCount++; continue; }
 
-          /* Build properties from all non-geometry columns */
+          /* Build GeoJSON properties from all non-geometry columns */
           const properties = {};
           columns.forEach((col, i) => {
             if (i !== geomIdx) {
-              /* Convert Uint8Array blobs to string placeholder */
-              properties[col] = (row[i] instanceof Uint8Array)
-                ? '[blob]'
-                : row[i];
+              /* Convert binary blobs to a readable placeholder */
+              properties[col] = (row[i] instanceof Uint8Array) ? '[blob]' : row[i];
             }
           });
 
           features.push({ type: 'Feature', geometry, properties });
         }
 
-        if (features.length === 0) continue;
+        if (parseErrCount > 0) {
+          console.warn(`[GPKG] "${table.label}": ${parseErrCount} geometria(s) ignorada(s).`);
+        }
 
-        /* 8. Add as a layer */
-        const layerName = `${baseName(file.name)} · ${table.label}`;
+        if (features.length === 0) {
+          skipped.push(`"${table.label}" — nenhuma geometria válida`);
+          continue;
+        }
+
+        /* 8. Add as a new layer in the map */
         LayerManager.addGeoJSONLayer(
           { type: 'FeatureCollection', features },
-          layerName
+          `${baseName(file.name)} · ${table.label}`
         );
         totalFeatures += features.length;
         layersAdded++;
 
       } catch (tableErr) {
-        console.warn(`[GPKG] Erro na tabela "${table.name}":`, tableErr);
+        console.error(`[GPKG] Erro crítico na tabela "${table.name}":`, tableErr);
+        skipped.push(`"${table.label}" — ${tableErr.message}`);
       }
     }
 
     db.close();
-    setProgress(fill, lbl, 100, `${totalFeatures} feições carregadas!`);
+    setProgress(fill, lbl, 100, `Concluído! ${totalFeatures.toLocaleString('pt-BR')} feições.`);
     hideProgress(prog);
+
+    /* Report any skipped layers */
+    if (skipped.length > 0) {
+      console.warn('[GPKG] Camadas ignoradas:', skipped);
+      showToast(
+        `${skipped.length} camada(s) ignorada(s). Abra o Console (F12) para detalhes.`,
+        'warning', 5000
+      );
+    }
 
     if (layersAdded === 0) {
       throw new Error('Nenhuma feição válida encontrada no GeoPackage.');
@@ -439,42 +571,9 @@ const FileLoader = (() => {
 
     LayerManager.zoomToAll();
     showToast(
-      `GeoPackage carregado! ${layersAdded} camada(s) · ${totalFeatures} feições.`,
-      'success', 5000
+      `GeoPackage: ${layersAdded} de ${featureTables.length} camada(s) · ${totalFeatures.toLocaleString('pt-BR')} feições.`,
+      'success', 6000
     );
-  }
-
-
-  async function loadGeoTIFF(file) {
-    if (typeof parseGeoraster === 'undefined' || typeof GeoRasterLayer === 'undefined') {
-      throw new Error('Biblioteca GeoRaster não carregada. Verifique a conexão à internet.');
-    }
-
-    const { prog, fill, lbl } = showProgress('Lendo GeoTIFF...');
-    setProgress(fill, lbl, 25, 'Decodificando pixels...');
-
-    const arrayBuffer = await file.arrayBuffer();
-    setProgress(fill, lbl, 55, 'Processando raster...');
-
-    let georaster;
-    try {
-      georaster = await parseGeoraster(arrayBuffer);
-    } catch (e) {
-      hideProgress(prog);
-      throw new Error('Erro ao decodificar GeoTIFF: ' + e.message);
-    }
-
-    setProgress(fill, lbl, 85, 'Renderizando no mapa...');
-    const name = baseName(file.name);
-    LayerManager.addGeoTIFFLayer(georaster, name);
-
-    setProgress(fill, lbl, 100, 'GeoTIFF renderizado!');
-    hideProgress(prog);
-
-    const bands = georaster.numberOfRasters || 1;
-    const w = georaster.width || '?';
-    const h = georaster.height || '?';
-    showToast(`GeoTIFF "${name}" carregado! ${w}×${h}px · ${bands} banda(s).`, 'success');
   }
 
   /* ── Route file(s) by type ── */
