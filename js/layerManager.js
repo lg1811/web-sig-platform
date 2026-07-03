@@ -1,56 +1,45 @@
 /* ============================================================
    layerManager.js – Layer Management
-   GeoWebSIG · Add, remove, toggle layers, zoom to extent
+   GeoWebSIG · Add, remove, toggle, zoom layers
    ============================================================ */
 
 'use strict';
 
 const LayerManager = (() => {
 
-  /* Internal layer registry: { id, name, type, color, leafletLayer, visible } */
+  /* ── Internal registry ── */
   const _layers = [];
   let _idCounter = 0;
 
-  /* ── Region color maps ── */
+  /* ── Color map for Brazilian regions ── */
   const REGION_COLORS = {
-    'Norte':        '#22d3ee',
-    'Nordeste':     '#fb923c',
-    'Centro-Oeste': '#a78bfa',
-    'Sudeste':      '#4f8ef7',
-    'Sul':          '#34d399',
+    'Norte':         '#22d3ee',
+    'Nordeste':      '#fb923c',
+    'Centro-Oeste':  '#a78bfa',
+    'Sudeste':       '#4f8ef7',
+    'Sul':           '#34d399',
   };
 
   /* ── Style helpers ── */
+  function _regionColor(feature, fallback) {
+    const n = feature.properties?.regiao || feature.properties?.nome;
+    return REGION_COLORS[n] || fallback;
+  }
+
   function polygonStyle(feature, color) {
-    const regionName = feature.properties?.regiao || feature.properties?.nome;
-    const fillColor = REGION_COLORS[regionName] || color;
-    return {
-      color: fillColor,
-      weight: 2,
-      opacity: 0.9,
-      fillColor: fillColor,
-      fillOpacity: 0.18,
-    };
+    const c = _regionColor(feature, color);
+    return { color: c, weight: 2, opacity: 0.9, fillColor: c, fillOpacity: 0.18 };
   }
 
   function highlightStyle(feature, color) {
-    const regionName = feature.properties?.regiao || feature.properties?.nome;
-    const fillColor = REGION_COLORS[regionName] || color;
-    return {
-      color: fillColor,
-      weight: 3,
-      opacity: 1,
-      fillColor: fillColor,
-      fillOpacity: 0.35,
-    };
+    const c = _regionColor(feature, color);
+    return { color: c, weight: 3, opacity: 1, fillColor: c, fillOpacity: 0.35 };
   }
 
   function makePointMarker(feature, latlng, color) {
-    const regionName = feature.properties?.regiao;
-    const markerColor = REGION_COLORS[regionName] || color;
     return L.circleMarker(latlng, {
       radius: 7,
-      fillColor: markerColor,
+      fillColor: _regionColor(feature, color),
       color: '#fff',
       weight: 2,
       opacity: 1,
@@ -73,46 +62,52 @@ const LayerManager = (() => {
         if (l.setStyle) l.setStyle(polygonStyle(feature, layerColor));
       },
       click(e) {
-        /* Stop event from bubbling to map (prevents measurement tool conflicts) */
         L.DomEvent.stopPropagation(e);
-
         if (AppState.activeTool === 'measure-distance' || AppState.activeTool === 'measure-area') return;
 
-        try {
-          const props = feature.properties || {};
-          const geomType = (feature.geometry && feature.geometry.type) ? feature.geometry.type : 'Feature';
-          showAttributeModal(props, geomType);
-        } catch (err) {
-          console.error('[LayerManager] Erro ao abrir atributos:', err);
-          showToast('Erro ao exibir atributos da feição.', 'error');
-        }
+        /* Leaflet stores the GeoJSON feature directly on the layer as `.feature`.
+           This is more reliable than the closure variable in edge cases. */
+        const geoFeature = (e.target && e.target.feature) ? e.target.feature : feature;
+        const props      = (geoFeature && geoFeature.properties != null) ? geoFeature.properties : null;
+        const geomType   = (geoFeature && geoFeature.geometry && geoFeature.geometry.type) || 'Feature';
+
+        console.log('[GeoWebSIG] Clique na feição | geometria:', geomType, '| props:', props);
+        showAttributeModal(props, geomType);
       }
     });
   }
 
-  /* ── Add GeoJSON ── */
-  function addGeoJSONLayer(geojson, name, options = {}) {
-    const color = options.color || nextColor();
-    const id = ++_idCounter;
+  /* ── Detect geometry type from GeoJSON ── */
+  function detectGeomType(geojson) {
+    const features = geojson?.features || [geojson];
+    for (const f of features) {
+      const t = f?.geometry?.type || f?.type;
+      if (t && t !== 'FeatureCollection' && t !== 'Feature') return t.replace('Multi', '');
+    }
+    return 'Unknown';
+  }
 
-    let leafletLayer;
+  /* ── Add GeoJSON layer ── */
+  function addGeoJSONLayer(geojson, name, options = {}) {
+    const color    = options.color || nextColor();
+    const id       = ++_idCounter;
     const geomType = detectGeomType(geojson);
 
-    if (geomType === 'Point' || geomType === 'MultiPoint') {
-      leafletLayer = L.geoJSON(geojson, {
-        pointToLayer: (f, ll) => makePointMarker(f, ll, color),
-        onEachFeature: (f, l) => onEachFeature(f, l, color),
-      });
-    } else {
-      leafletLayer = L.geoJSON(geojson, {
-        style: (f) => polygonStyle(f, color),
-        onEachFeature: (f, l) => onEachFeature(f, l, color),
-      });
-    }
+    const leafletLayer = L.geoJSON(geojson, {
+      style:         (f) => polygonStyle(f, color),
+      pointToLayer:  (f, ll) => makePointMarker(f, ll, color),
+      onEachFeature: (f, l) => onEachFeature(f, l, color),
+    });
 
     leafletLayer.addTo(AppState.map);
 
-    const entry = { id, name, type: options.type || geomType, color, leafletLayer, visible: true, source: options.source || 'upload' };
+    const entry = {
+      id, name, color,
+      type:         options.type || geomType,
+      leafletLayer,
+      visible:      true,
+      source:       options.source || 'upload',
+    };
     _layers.push(entry);
 
     renderLayerItem(entry);
@@ -122,23 +117,22 @@ const LayerManager = (() => {
     return entry;
   }
 
-  /* ── Add GeoTIFF (raster) layer ── */
+  /* ── Add GeoTIFF raster layer ── */
   function addGeoTIFFLayer(georaster, name) {
-    const id = ++_idCounter;
+    const id    = ++_idCounter;
     const color = nextColor();
 
-    const min = georaster.mins ? georaster.mins[0] : 0;
-    const max = georaster.maxs ? georaster.maxs[0] : 255;
+    const min   = georaster.mins?.[0] ?? 0;
+    const max   = georaster.maxs?.[0] ?? 255;
     const range = max - min || 1;
 
     const leafletLayer = new GeoRasterLayer({
       georaster,
       opacity: 0.75,
-      pixelValuesToColorFn: (values) => {
+      pixelValuesToColorFn(values) {
         const v = values[0];
-        if (v === null || v === undefined || isNaN(v) || v === georaster.noDataValue) return null;
+        if (v == null || isNaN(v) || v === georaster.noDataValue) return null;
         const t = (v - min) / range;
-        // Viridis-like color ramp
         const r = Math.round(68  + (253 - 68)  * t);
         const g = Math.round(1   + (231 - 1)   * t);
         const b = Math.round(84  + (37  - 84)  * t);
@@ -148,9 +142,9 @@ const LayerManager = (() => {
     });
 
     leafletLayer.addTo(AppState.map);
-    AppState.map.fitBounds(leafletLayer.getBounds());
+    try { AppState.map.fitBounds(leafletLayer.getBounds()); } catch (_) {}
 
-    const entry = { id, name, type: 'GeoTIFF', color, leafletLayer, visible: true, source: 'upload' };
+    const entry = { id, name, color, type: 'GeoTIFF', leafletLayer, visible: true, source: 'upload' };
     _layers.push(entry);
 
     renderLayerItem(entry);
@@ -160,26 +154,11 @@ const LayerManager = (() => {
     return entry;
   }
 
-  /* ── Detect geometry type ── */
-  function detectGeomType(geojson) {
-    if (!geojson) return 'Unknown';
-    const features = geojson.features || [geojson];
-    for (const f of features) {
-      const gt = f.geometry?.type || f.type;
-      if (gt) return gt.replace('Multi', '');
-    }
-    return 'Unknown';
-  }
-
   /* ── Render sidebar layer item ── */
   function renderLayerItem(entry) {
-    const emptyMsg = document.getElementById('layer-empty-msg');
-    if (emptyMsg) emptyMsg.remove();
-
     const typeLabels = {
-      'Point': '● Ponto', 'LineString': '━ Linha', 'Polygon': '▬ Polígono',
-      'GeoTIFF': '▦ Raster', 'polygon': '▬ Polígono', 'point': '● Ponto',
-      'Unknown': '◆ Vetor'
+      Point: '● Ponto', LineString: '━ Linha', Polygon: '▬ Polígono',
+      GeoTIFF: '▦ Raster', polygon: '▬ Polígono', point: '● Ponto', Unknown: '◆ Vetor',
     };
     const typeLabel = typeLabels[entry.type] || entry.type;
 
@@ -187,7 +166,8 @@ const LayerManager = (() => {
     li.className = 'layer-item';
     li.id = `layer-item-${entry.id}`;
     li.innerHTML = `
-      <div class="layer-color-dot" style="color:${entry.color};background:${entry.color}20;border:1.5px solid ${entry.color}"></div>
+      <div class="layer-color-dot"
+           style="color:${entry.color};background:${entry.color}20;border:1.5px solid ${entry.color}"></div>
       <div class="layer-info">
         <div class="layer-name" title="${entry.name}">${entry.name}</div>
         <div class="layer-type-badge">${typeLabel}</div>
@@ -201,32 +181,25 @@ const LayerManager = (() => {
         </button>
         <button class="btn-icon btn-ghost layer-zoom" data-id="${entry.id}" title="Zoom para camada">
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-            <circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/>
-            <line x1="11" y1="8" x2="11" y2="14"/><line x1="8" y1="11" x2="14" y2="11"/>
+            <circle cx="11" cy="11" r="8"/>
+            <line x1="21" y1="21" x2="16.65" y2="16.65"/>
+            <line x1="11" y1="8" x2="11" y2="14"/>
+            <line x1="8" y1="11" x2="14" y2="11"/>
           </svg>
         </button>
-        <button class="btn-icon btn-ghost layer-remove" data-id="${entry.id}" title="Remover camada" style="color:var(--danger)">
+        <button class="btn-icon btn-ghost layer-remove" data-id="${entry.id}"
+                title="Remover camada" style="color:var(--danger)">
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-            <polyline points="3 6 5 6 21 6"/><path d="M19 6l-1 14a2 2 0 01-2 2H8a2 2 0 01-2-2L5 6"/>
-            <path d="M10 11v6M14 11v6"/><path d="M9 6V4h6v2"/>
+            <polyline points="3 6 5 6 21 6"/>
+            <path d="M19 6l-1 14a2 2 0 01-2 2H8a2 2 0 01-2-2L5 6"/>
+            <path d="M10 11v6M14 11v6M9 6V4h6v2"/>
           </svg>
         </button>
-      </div>
-    `;
+      </div>`;
 
-    /* Events */
-    li.querySelector('.layer-toggle').addEventListener('click', (e) => {
-      e.stopPropagation();
-      toggleLayer(entry.id);
-    });
-    li.querySelector('.layer-zoom').addEventListener('click', (e) => {
-      e.stopPropagation();
-      zoomToLayer(entry.id);
-    });
-    li.querySelector('.layer-remove').addEventListener('click', (e) => {
-      e.stopPropagation();
-      removeLayer(entry.id);
-    });
+    li.querySelector('.layer-toggle').addEventListener('click', (e) => { e.stopPropagation(); toggleLayer(entry.id); });
+    li.querySelector('.layer-zoom').addEventListener('click',   (e) => { e.stopPropagation(); zoomToLayer(entry.id); });
+    li.querySelector('.layer-remove').addEventListener('click', (e) => { e.stopPropagation(); removeLayer(entry.id); });
 
     document.getElementById('layer-list').prepend(li);
   }
@@ -236,43 +209,33 @@ const LayerManager = (() => {
     const entry = _layers.find(l => l.id === id);
     if (!entry) return;
     entry.visible = !entry.visible;
-    if (entry.visible) {
-      AppState.map.addLayer(entry.leafletLayer);
-    } else {
-      AppState.map.removeLayer(entry.leafletLayer);
-    }
+    entry.visible ? AppState.map.addLayer(entry.leafletLayer)
+                  : AppState.map.removeLayer(entry.leafletLayer);
     const btn = document.querySelector(`#layer-item-${id} .layer-toggle`);
-    if (btn) btn.style.opacity = entry.visible ? '1' : '0.3';
+    if (btn) btn.style.opacity = entry.visible ? '1' : '0.35';
   }
 
-  /* ── Zoom to layer ── */
+  /* ── Zoom to single layer ── */
   function zoomToLayer(id) {
     const entry = _layers.find(l => l.id === id);
     if (!entry) return;
     try {
-      if (entry.leafletLayer.getBounds) {
-        AppState.map.fitBounds(entry.leafletLayer.getBounds(), { padding: [30, 30] });
-      }
-    } catch (e) { /* raster may throw */ }
+      const b = entry.leafletLayer.getBounds();
+      if (b && b.isValid()) AppState.map.fitBounds(b, { padding: [30, 30] });
+    } catch (_) {}
   }
 
-  /* ── Zoom to all ── */
+  /* ── Zoom to all layers ── */
   function zoomToAll() {
     if (_layers.length === 0) return;
     let bounds = null;
     _layers.forEach(entry => {
       try {
-        if (entry.leafletLayer.getBounds) {
-          const b = entry.leafletLayer.getBounds();
-          if (b.isValid()) {
-            bounds = bounds ? bounds.extend(b) : b;
-          }
-        }
-      } catch (e) {}
+        const b = entry.leafletLayer.getBounds();
+        if (b && b.isValid()) bounds = bounds ? bounds.extend(b) : b;
+      } catch (_) {}
     });
-    if (bounds && bounds.isValid()) {
-      AppState.map.fitBounds(bounds, { padding: [40, 40] });
-    }
+    if (bounds && bounds.isValid()) AppState.map.fitBounds(bounds, { padding: [40, 40] });
   }
 
   /* ── Remove layer ── */
@@ -283,18 +246,17 @@ const LayerManager = (() => {
     _layers.splice(idx, 1);
     const li = document.getElementById(`layer-item-${id}`);
     if (li) {
-      li.style.animation = 'none';
+      li.style.transition = 'opacity 0.2s, transform 0.2s';
       li.style.opacity = '0';
       li.style.transform = 'translateX(-10px)';
-      li.style.transition = 'opacity 0.2s, transform 0.2s';
       setTimeout(() => li.remove(), 220);
     }
     updateLayerCount(_layers.length);
     if (_layers.length === 0) _showEmptyMsg();
-    showToast(`Camada removida.`, 'info', 2000);
+    showToast('Camada removida.', 'info', 2000);
   }
 
-  /* ── Clear all ── */
+  /* ── Clear all layers ── */
   function clearAll() {
     if (_layers.length === 0) return;
     _layers.forEach(e => AppState.map.removeLayer(e.leafletLayer));
@@ -305,71 +267,98 @@ const LayerManager = (() => {
     showToast('Todas as camadas removidas.', 'info', 2500);
   }
 
-  /* ── Get all layers ── */
   function getLayers() { return _layers; }
 
   /* ── Empty message helpers ── */
   function _showEmptyMsg() {
     const ul = document.getElementById('layer-list');
-    if (!document.getElementById('layer-empty-msg')) {
-      const li = document.createElement('li');
-      li.className = 'layer-empty';
-      li.id = 'layer-empty-msg';
-      li.innerHTML = `
-        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" style="width:32px;height:32px;opacity:0.3;margin-bottom:8px">
-          <polygon points="3 6 9 3 15 6 21 3 21 18 15 21 9 18 3 21"/>
-        </svg>
-        <span>Nenhuma camada carregada</span>
-      `;
-      ul.appendChild(li);
-    }
+    if (document.getElementById('layer-empty-msg')) return;
+    const li = document.createElement('li');
+    li.className = 'layer-empty';
+    li.id = 'layer-empty-msg';
+    li.innerHTML = `
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"
+           style="width:32px;height:32px;opacity:0.3;margin-bottom:8px">
+        <polygon points="3 6 9 3 15 6 21 3 21 18 15 21 9 18 3 21"/>
+      </svg>
+      <span>Nenhuma camada carregada</span>`;
+    ul.appendChild(li);
   }
   function _hideEmptyMsg() {
-    const el = document.getElementById('layer-empty-msg');
-    if (el) el.remove();
+    document.getElementById('layer-empty-msg')?.remove();
   }
 
   return { addGeoJSONLayer, addGeoTIFFLayer, removeLayer, toggleLayer, zoomToLayer, zoomToAll, clearAll, getLayers };
 })();
 
-/* ── Attribute Modal ── */
+/* ============================================================
+   showAttributeModal – exibe tabela de atributos da feição
+   ============================================================ */
 function showAttributeModal(properties, geomType) {
   const modal = document.getElementById('attr-modal');
   const title = document.getElementById('modal-title');
   const tbody = document.getElementById('attr-table-body');
 
   if (!modal || !title || !tbody) {
-    console.error('[showAttributeModal] Elementos do modal não encontrados no DOM.');
+    console.error('[showAttributeModal] Elementos do modal não encontrados.');
     return;
   }
 
   title.textContent = `Atributos · ${geomType}`;
   tbody.innerHTML = '';
 
-  const entries = properties ? Object.entries(properties) : [];
+  /* Coleta TODAS as chaves do objeto properties.
+     Usa Object.keys() que lista apenas propriedades próprias e enumeráveis,
+     exatamente o que precisamos para atributos GeoJSON/Shapefile/GeoPackage. */
+  const keys = properties != null ? Object.keys(properties) : [];
 
-  if (entries.length === 0) {
+  if (keys.length === 0) {
+    /* Se chegou aqui com keys vazio, mostre um diagnóstico útil */
     const tr = document.createElement('tr');
-    tr.innerHTML = `<td colspan="2" style="text-align:center;color:var(--text-muted);font-style:italic;padding:20px">Sem atributos</td>`;
+    tr.innerHTML = `
+      <td colspan="2" style="padding:16px;text-align:center;color:var(--text-muted)">
+        <div style="font-style:italic;margin-bottom:6px">Sem atributos nesta feição.</div>
+        <div style="font-size:10px;font-family:'JetBrains Mono',monospace">
+          tipo: ${typeof properties} | valor: ${JSON.stringify(properties)}
+        </div>
+        <div style="font-size:10px;margin-top:4px">Abra o Console (F12) para mais detalhes.</div>
+      </td>`;
     tbody.appendChild(tr);
   } else {
-    entries.forEach(([key, val]) => {
-      const tr = document.createElement('tr');
+    keys.forEach(key => {
+      const val = properties[key];
+      const tr  = document.createElement('tr');
+
+      /* Renderização segura do valor */
       let displayVal;
       if (val === null || val === undefined) {
         displayVal = '<span style="color:var(--text-muted);font-style:italic">nulo</span>';
       } else if (typeof val === 'number') {
-        displayVal = val.toLocaleString('pt-BR');
+        /* Formata número: inteiros sem casas, decimais com até 6 casas */
+        displayVal = Number.isInteger(val)
+          ? val.toLocaleString('pt-BR')
+          : val.toLocaleString('pt-BR', { maximumFractionDigits: 6 });
+      } else if (typeof val === 'boolean') {
+        displayVal = val ? '<span style="color:var(--success)">✓ verdadeiro</span>'
+                        : '<span style="color:var(--danger)">✗ falso</span>';
       } else if (typeof val === 'object') {
-        displayVal = `<code style="font-size:10px">${JSON.stringify(val)}</code>`;
+        displayVal = `<code style="font-size:10px;word-break:break-all">${JSON.stringify(val)}</code>`;
       } else {
-        /* Escape HTML to prevent XSS from attribute values */
+        /* String — escapa HTML para segurança */
         displayVal = String(val)
           .replace(/&/g, '&amp;')
           .replace(/</g, '&lt;')
-          .replace(/>/g, '&gt;');
+          .replace(/>/g, '&gt;')
+          .replace(/\n/g, '<br>');
       }
-      tr.innerHTML = `<td>${key}</td><td>${displayVal}</td>`;
+
+      /* Escapa também o nome da chave */
+      const safeKey = String(key)
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;');
+
+      tr.innerHTML = `<td>${safeKey}</td><td>${displayVal}</td>`;
       tbody.appendChild(tr);
     });
   }
@@ -377,12 +366,17 @@ function showAttributeModal(properties, geomType) {
   modal.classList.remove('hidden');
 }
 
-/* Close modal */
+/* ── Fechar modal ── */
 document.addEventListener('DOMContentLoaded', () => {
   document.getElementById('modal-close').addEventListener('click', () => {
     document.getElementById('attr-modal').classList.add('hidden');
   });
   document.getElementById('modal-backdrop').addEventListener('click', () => {
     document.getElementById('attr-modal').classList.add('hidden');
+  });
+  document.addEventListener('keydown', (e) => {
+    if (e.key === 'Escape') {
+      document.getElementById('attr-modal').classList.add('hidden');
+    }
   });
 });
