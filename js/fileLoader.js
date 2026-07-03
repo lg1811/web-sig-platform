@@ -283,77 +283,189 @@ const FileLoader = (() => {
     return -1;
   }
 
-  /* ── GeoPackage Raster Tile Loader ─────────────────────────────
-     Lê camadas de tiles (raster) de um GeoPackage.
-     Cada camada tile é uma tabela com colunas:
-       zoom_level | tile_column | tile_row | tile_data (PNG/JPEG blob)
-     Assembla os tiles em um <canvas> e exibe como L.imageOverlay.
+  /* ================================================================
+     GeoPackage Raster Tile Loader — versão completa
+     Suporta:
+       • PNG/JPEG tiles (imagery normal)
+       • TIFF float32 tiles (2d-gridded-coverage: NDVI, LST, etc.)
+     Reprojeção:
+       • EPSG:4326 → direto
+       • EPSG:3857 → cálculo direto
+       • UTM WGS84 (32601-32760) → string proj4 gerada automaticamente
+       • SIRGAS 2000/UTM (31981-31987) → string proj4 gerada automaticamente
+       • Outros → lê WKT de gpkg_spatial_ref_sys e passa ao proj4
+     ================================================================ */
+
+  /* ── Paleta de cores "plasma" para dados científicos ── */
+  function _plasmaColor(t) {
+    /* Simplificação da paleta Plasma (Matplotlib):
+       t=0 → roxo escuro | t=0.5 → laranja | t=1 → amarelo */
+    t = Math.max(0, Math.min(1, t));
+    const r = Math.round(13  + (240 - 13)  * t);
+    const g = Math.round(8   + (249 - 8)   * (t < 0.5 ? t * 0.6 : t));
+    const b = Math.round(135 + (33  - 135) * t);
+    return [r, g, b];
+  }
+
+  /* ── Detecta formato do tile pelos magic bytes ── */
+  function _tileFormat(data) {
+    if (!data || data.length < 4) return 'unknown';
+    /* PNG: 89 50 4E 47 */
+    if (data[0] === 0x89 && data[1] === 0x50) return 'image/png';
+    /* JPEG: FF D8 FF */
+    if (data[0] === 0xFF && data[1] === 0xD8) return 'image/jpeg';
+    /* WebP: 52 49 46 46 ?? ?? ?? ?? 57 45 42 50 */
+    if (data[0] === 0x52 && data[1] === 0x49 && data[8] === 0x57) return 'image/webp';
+    /* TIFF little-endian: 49 49 2A 00 | big-endian: 4D 4D 00 2A */
+    if ((data[0] === 0x49 && data[1] === 0x49 && data[2] === 0x2A) ||
+        (data[0] === 0x4D && data[1] === 0x4D && data[2] === 0x00)) return 'image/tiff';
+    return 'unknown';
+  }
+
+  /* ── Decodifica um tile TIFF float32 e pinta no canvas ─────────
+     Usa GeoTIFF.js (CDN). Renderiza com paleta "plasma".
+     Retorna true se bem-sucedido.
   ─────────────────────────────────────────────────────────────── */
+  async function _drawTiffTile(data, ctx, colPx, rowPx, tileW, tileH, minVal, maxVal) {
+    if (typeof GeoTIFF === 'undefined') {
+      console.warn('[GPKG TIFF] GeoTIFF.js não disponível');
+      return false;
+    }
+    try {
+      /* GeoTIFF.js lê o ArrayBuffer do tile TIFF */
+      const buf  = data.buffer.slice(data.byteOffset, data.byteOffset + data.byteLength);
+      const tiff = await GeoTIFF.fromArrayBuffer(buf);
+      const img  = await tiff.getImage();
+      const rasters = await img.readRasters();
+
+      const band  = rasters[0];
+      const w     = img.getWidth();
+      const h     = img.getHeight();
+      const range = maxVal - minVal || 1;
+
+      /* Cria ImageData e aplica paleta plasma */
+      const imgData = ctx.createImageData(w, h);
+      for (let i = 0; i < band.length; i++) {
+        const v = band[i];
+        /* Trata NaN / NoData como transparente */
+        if (!isFinite(v)) {
+          imgData.data[i * 4 + 3] = 0;
+          continue;
+        }
+        const t = Math.max(0, Math.min(1, (v - minVal) / range));
+        const [r, g, b] = _plasmaColor(t);
+        imgData.data[i * 4]     = r;
+        imgData.data[i * 4 + 1] = g;
+        imgData.data[i * 4 + 2] = b;
+        imgData.data[i * 4 + 3] = 210; /* levemente transparente */
+      }
+
+      /* Desenha numa sub-canvas e copia para o canvas principal */
+      const tmp  = document.createElement('canvas');
+      tmp.width  = w;
+      tmp.height = h;
+      tmp.getContext('2d').putImageData(imgData, 0, 0);
+      ctx.drawImage(tmp, colPx, rowPx);
+      return true;
+
+    } catch (e) {
+      console.warn('[GPKG TIFF] decode error:', e.message);
+      return false;
+    }
+  }
+
+  /* ── Resolve proj4 string para um EPSG sem precisar do registry CDN ──
+     Cobre: UTM WGS84 norte/sul, SIRGAS 2000/UTM, lê WKT do gpkg_spatial_ref_sys
+  ─────────────────────────────────────────────────────────────── */
+  function _getProj4Def(db, srsId) {
+    /* UTM WGS84 Norte: EPSG 32601–32660 (zones 1–60N) */
+    if (srsId >= 32601 && srsId <= 32660) {
+      const z = srsId - 32600;
+      return `+proj=utm +zone=${z} +datum=WGS84 +units=m +no_defs`;
+    }
+    /* UTM WGS84 Sul: EPSG 32701–32760 (zones 1–60S) */
+    if (srsId >= 32701 && srsId <= 32760) {
+      const z = srsId - 32700;
+      return `+proj=utm +zone=${z} +south +datum=WGS84 +units=m +no_defs`;
+    }
+    /* SIRGAS 2000 / UTM Sul: EPSG 31981–31987 (zonas 21S–27S, Brasil) */
+    const sirgasMap = { 31981:21, 31982:22, 31983:23, 31984:24, 31985:25, 31986:26, 31987:27 };
+    if (sirgasMap[srsId]) {
+      return `+proj=utm +zone=${sirgasMap[srsId]} +south +ellps=GRS80 +towgs84=0,0,0,0,0,0,0 +units=m +no_defs`;
+    }
+    /* Lê WKT/proj4 de gpkg_spatial_ref_sys (o arquivo contém a definição!) */
+    try {
+      const r = db.exec(`SELECT definition FROM gpkg_spatial_ref_sys WHERE srs_id=${srsId} LIMIT 1`);
+      if (r.length && r[0].values.length) {
+        const def = r[0].values[0][0];
+        if (def && def !== 'undefined' && def.length > 5) {
+          console.log(`[GPKG] SRS ${srsId} lido de gpkg_spatial_ref_sys`);
+          return def;
+        }
+      }
+    } catch (_) {}
+    return null;
+  }
+
+  /* ── GeoPackage Raster Tile Loader ── */
   async function _loadGpkgRasterLayer(db, tableName, layerLabel) {
     console.log(`[GPKG Raster] Processando: "${tableName}"`);
 
-    /* 1. Lê extensão geográfica e SRS da camada */
+    /* 1. Extensão geográfica e SRS */
     let minX, minY, maxX, maxY, srsId;
     try {
-      const r = db.exec(`SELECT min_x, min_y, max_x, max_y, srs_id
-                         FROM gpkg_tile_matrix_set WHERE table_name='${tableName}'`);
+      const r = db.exec(
+        `SELECT min_x, min_y, max_x, max_y, srs_id FROM gpkg_tile_matrix_set WHERE table_name='${tableName}'`
+      );
       if (!r.length || !r[0].values.length) throw new Error('sem dados em gpkg_tile_matrix_set');
       [minX, minY, maxX, maxY, srsId] = r[0].values[0];
       console.log(`[GPKG Raster] "${tableName}": extent=[${minX},${minY},${maxX},${maxY}] SRS=${srsId}`);
     } catch (e) {
-      console.warn(`[GPKG Raster] "${tableName}": erro no tile_matrix_set:`, e.message);
+      console.warn(`[GPKG Raster] "${tableName}":`, e.message);
       return false;
     }
 
-    /* 2. Lê os níveis de zoom disponíveis */
+    /* 2. Níveis de zoom */
     let zoomLevels = [];
     try {
-      const r = db.exec(`SELECT zoom_level, matrix_width, matrix_height, tile_width, tile_height
-                         FROM gpkg_tile_matrix WHERE table_name='${tableName}'
-                         ORDER BY zoom_level ASC`);
+      const r = db.exec(
+        `SELECT zoom_level, matrix_width, matrix_height, tile_width, tile_height
+         FROM gpkg_tile_matrix WHERE table_name='${tableName}' ORDER BY zoom_level ASC`
+      );
       if (!r.length || !r[0].values.length) throw new Error('sem dados em gpkg_tile_matrix');
-      zoomLevels = r[0].values.map(v => ({
-        zoom: v[0], matrixW: v[1], matrixH: v[2], tileW: v[3], tileH: v[4]
-      }));
-      console.log(`[GPKG Raster] "${tableName}": ${zoomLevels.length} zoom(s):`, zoomLevels.map(z => z.zoom));
+      zoomLevels = r[0].values.map(v => ({ zoom:v[0], matrixW:v[1], matrixH:v[2], tileW:v[3], tileH:v[4] }));
     } catch (e) {
-      console.warn(`[GPKG Raster] "${tableName}": erro no tile_matrix:`, e.message);
+      console.warn(`[GPKG Raster] "${tableName}":`, e.message);
       return false;
     }
 
-    /* 3. Escolhe o zoom mais detalhado com ≤ 400 tiles totais
-          para não explodir a memória com rasters enormes */
+    /* 3. Escolhe zoom com ≤ 400 tiles e mais detalhe */
     let best = zoomLevels[0];
     for (const z of zoomLevels) {
-      const total = z.matrixW * z.matrixH;
-      if (total <= 400) best = z;
+      if (z.matrixW * z.matrixH <= 400) best = z;
     }
 
-    /* Verifica quantos tiles existem DE FATO no banco no zoom escolhido */
+    /* 4. Busca tiles no banco */
     let tileRows = [];
     try {
-      const r = db.exec(`SELECT tile_column, tile_row, tile_data
-                         FROM "${tableName}" WHERE zoom_level=${best.zoom}`);
+      const r = db.exec(
+        `SELECT tile_column, tile_row, tile_data FROM "${tableName}" WHERE zoom_level=${best.zoom}`
+      );
       if (r.length && r[0].values.length) tileRows = r[0].values;
-      console.log(`[GPKG Raster] "${tableName}": zoom ${best.zoom} → ${tileRows.length} tile(s) no banco`);
     } catch (e) {
       console.warn(`[GPKG Raster] "${tableName}": erro ao ler tiles:`, e.message);
       return false;
     }
 
+    /* Fallback para outro zoom se não encontrou tiles */
     if (tileRows.length === 0) {
-      /* Tenta o maior zoom disponível */
       for (let zi = zoomLevels.length - 1; zi >= 0; zi--) {
         try {
           const z = zoomLevels[zi];
-          const r = db.exec(`SELECT tile_column, tile_row, tile_data
-                             FROM "${tableName}" WHERE zoom_level=${z.zoom} LIMIT 500`);
-          if (r.length && r[0].values.length) {
-            best = z;
-            tileRows = r[0].values;
-            console.log(`[GPKG Raster] "${tableName}": fallback zoom ${z.zoom} → ${tileRows.length} tile(s)`);
-            break;
-          }
+          const r = db.exec(
+            `SELECT tile_column, tile_row, tile_data FROM "${tableName}" WHERE zoom_level=${z.zoom} LIMIT 500`
+          );
+          if (r.length && r[0].values.length) { best = z; tileRows = r[0].values; break; }
         } catch (_) {}
       }
     }
@@ -362,61 +474,105 @@ const FileLoader = (() => {
       console.warn(`[GPKG Raster] "${tableName}": nenhum tile encontrado`);
       return false;
     }
+    console.log(`[GPKG Raster] "${tableName}": zoom=${best.zoom} | ${tileRows.length} tile(s)`);
 
-    /* 4. Assembla os tiles em um <canvas> */
+    /* 5. Detecta formato dos tiles pelo primeiro tile com dados */
+    let format = 'unknown';
+    for (const [,, data] of tileRows) {
+      if (data) {
+        const bytes = data instanceof Uint8Array ? data : new Uint8Array(data);
+        format = _tileFormat(bytes);
+        break;
+      }
+    }
+    console.log(`[GPKG Raster] "${tableName}": formato detectado → ${format}`);
+
+    /* 6. Canvas principal */
     const canvasW = best.matrixW * best.tileW;
     const canvasH = best.matrixH * best.tileH;
-
-    /* Limite de segurança de canvas */
     if (canvasW > 16384 || canvasH > 16384) {
-      console.warn(`[GPKG Raster] "${tableName}": canvas muito grande (${canvasW}×${canvasH}), pulando.`);
+      console.warn(`[GPKG Raster] "${tableName}": canvas muito grande (${canvasW}×${canvasH})`);
       return false;
     }
-
-    console.log(`[GPKG Raster] "${tableName}": canvas ${canvasW}×${canvasH}px`);
-
     const canvas = document.createElement('canvas');
     canvas.width  = canvasW;
     canvas.height = canvasH;
     const ctx = canvas.getContext('2d');
 
     let drawn = 0;
-    await Promise.all(tileRows.map(([col, row, data]) => new Promise(resolve => {
-      if (!data) { resolve(); return; }
 
-      const blob = new Blob([data instanceof Uint8Array ? data : new Uint8Array(data)]);
-      const url  = URL.createObjectURL(blob);
-      const img  = new Image();
+    if (format === 'image/tiff') {
+      /* ── TIFF float32: dois passos ─────────────────────────────
+         Passo 1: varre todos os tiles para encontrar min/max global
+         Passo 2: renderiza com escala de cores consistente         */
+      console.log(`[GPKG Raster] "${tableName}": decodificando TIFF float32 com GeoTIFF.js...`);
 
-      img.onload = () => {
-        /* GeoPackage spec: tile_row=0 é o canto SUPERIOR-ESQUERDO (norte).
-           Alguns softwares (QGIS, GDAL) invertem (TMS: row=0 = sul).
-           Tentamos primeiro com o modo padrão (sem inversão).
-           Se aparecer de cabeça para baixo, o problema é convenção TMS. */
-        ctx.drawImage(img, col * best.tileW, row * best.tileH);
-        URL.revokeObjectURL(url);
-        drawn++;
-        resolve();
-      };
-      img.onerror = () => { URL.revokeObjectURL(url); resolve(); };
-      img.src = url;
-    })));
+      let globalMin = Infinity, globalMax = -Infinity;
+
+      /* Passo 1 — scan de min/max */
+      for (const [,, rawData] of tileRows) {
+        if (!rawData) continue;
+        try {
+          const bytes = rawData instanceof Uint8Array ? rawData : new Uint8Array(rawData);
+          const buf   = bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength);
+          const tiff  = await GeoTIFF.fromArrayBuffer(buf);
+          const img   = await tiff.getImage();
+          const rasters = await img.readRasters();
+          for (const v of rasters[0]) {
+            if (isFinite(v)) {
+              if (v < globalMin) globalMin = v;
+              if (v > globalMax) globalMax = v;
+            }
+          }
+        } catch (_) {}
+      }
+
+      if (!isFinite(globalMin) || globalMin === globalMax) {
+        globalMin = 0; globalMax = 1;
+      }
+      console.log(`[GPKG Raster] "${tableName}": min=${globalMin.toFixed(4)} max=${globalMax.toFixed(4)}`);
+
+      /* Passo 2 — render */
+      for (const [col, row, rawData] of tileRows) {
+        if (!rawData) continue;
+        const bytes = rawData instanceof Uint8Array ? rawData : new Uint8Array(rawData);
+        const ok = await _drawTiffTile(bytes, ctx, col * best.tileW, row * best.tileH,
+                                       best.tileW, best.tileH, globalMin, globalMax);
+        if (ok) drawn++;
+      }
+
+    } else {
+      /* ── PNG / JPEG / WebP: carrega como <img> ─────────────── */
+      await Promise.all(tileRows.map(([col, row, rawData]) => new Promise(resolve => {
+        if (!rawData) { resolve(); return; }
+        const bytes = rawData instanceof Uint8Array ? rawData : new Uint8Array(rawData);
+        const blob  = new Blob([bytes], { type: format !== 'unknown' ? format : 'image/png' });
+        const url   = URL.createObjectURL(blob);
+        const img   = new Image();
+        img.onload  = () => {
+          ctx.drawImage(img, col * best.tileW, row * best.tileH);
+          URL.revokeObjectURL(url);
+          drawn++;
+          resolve();
+        };
+        img.onerror = () => { URL.revokeObjectURL(url); resolve(); };
+        img.src = url;
+      })));
+    }
 
     if (drawn === 0) {
-      console.warn(`[GPKG Raster] "${tableName}": nenhum tile desenhado`);
+      console.warn(`[GPKG Raster] "${tableName}": nenhum tile renderizado`);
       return false;
     }
-    console.log(`[GPKG Raster] "${tableName}": ${drawn} tile(s) desenhados`);
+    console.log(`[GPKG Raster] "${tableName}": ${drawn}/${tileRows.length} tile(s) renderizados`);
 
-    /* 5. Converte extensão para WGS84 lat/lng */
+    /* 7. Converte extensão para WGS84 ─────────────────────────── */
     let bounds;
 
     if (srsId === 4326) {
-      /* Já em graus — direto */
       bounds = [[minY, minX], [maxY, maxX]];
 
     } else if (srsId === 3857 || srsId === 900913) {
-      /* Web Mercator → WGS84 */
       const m2ll = (mx, my) => {
         const lng = mx / 20037508.34 * 180;
         const lat = Math.atan(Math.exp(my * Math.PI / 20037508.34)) * 360 / Math.PI - 90;
@@ -424,26 +580,34 @@ const FileLoader = (() => {
       };
       bounds = [m2ll(minX, minY), m2ll(maxX, maxY)];
 
-    } else if (typeof proj4 !== 'undefined') {
-      /* Tenta reprojetar com proj4 usando EPSG */
-      try {
-        const sw = proj4(`EPSG:${srsId}`, 'WGS84', [minX, minY]);
-        const ne = proj4(`EPSG:${srsId}`, 'WGS84', [maxX, maxY]);
-        bounds = [[sw[1], sw[0]], [ne[1], ne[0]]];
-        console.log(`[GPKG Raster] "${tableName}": reprojetado de EPSG:${srsId}`);
-      } catch (e) {
-        console.warn(`[GPKG Raster] "${tableName}": reprojeção de EPSG:${srsId} falhou:`, e.message);
+    } else {
+      /* Obtém a definição proj4 do EPSG — cobre UTM, SIRGAS, WKT do gpkg */
+      const proj4Def = _getProj4Def(db, srsId);
+
+      if (!proj4Def) {
+        console.warn(`[GPKG Raster] "${tableName}": SRS EPSG:${srsId} sem definição proj4 conhecida`);
         return false;
       }
 
-    } else {
-      console.warn(`[GPKG Raster] "${tableName}": SRS ${srsId} não suportado`);
-      return false;
+      if (typeof proj4 === 'undefined') {
+        console.warn(`[GPKG Raster] "${tableName}": proj4.js não carregado`);
+        return false;
+      }
+
+      try {
+        /* Registra a definição e usa na reprojeção */
+        proj4.defs(`CUSTOM:${srsId}`, proj4Def);
+        const sw = proj4(`CUSTOM:${srsId}`, 'WGS84', [minX, minY]);
+        const ne = proj4(`CUSTOM:${srsId}`, 'WGS84', [maxX, maxY]);
+        bounds = [[sw[1], sw[0]], [ne[1], ne[0]]];
+        console.log(`[GPKG Raster] "${tableName}": reprojetado de EPSG:${srsId} → WGS84`, bounds);
+      } catch (e) {
+        console.warn(`[GPKG Raster] "${tableName}": reprojeção falhou:`, e.message);
+        return false;
+      }
     }
 
-    console.log(`[GPKG Raster] "${tableName}": bounds WGS84:`, bounds);
-
-    /* 6. Exporta canvas como PNG e adiciona ao mapa */
+    /* 8. Exporta canvas e adiciona ao mapa */
     const dataUrl = canvas.toDataURL('image/png');
     LayerManager.addImageOverlayLayer(dataUrl, layerLabel, bounds);
     return true;
