@@ -296,10 +296,8 @@ const FileLoader = (() => {
        • Outros → lê WKT de gpkg_spatial_ref_sys e passa ao proj4
      ================================================================ */
 
-  /* ── Paleta de cores "plasma" para dados científicos ── */
+  /* ── Paleta plasma (fallback quando não há estilo QGIS) ── */
   function _plasmaColor(t) {
-    /* Simplificação da paleta Plasma (Matplotlib):
-       t=0 → roxo escuro | t=0.5 → laranja | t=1 → amarelo */
     t = Math.max(0, Math.min(1, t));
     const r = Math.round(13  + (240 - 13)  * t);
     const g = Math.round(8   + (249 - 8)   * (t < 0.5 ? t * 0.6 : t));
@@ -307,63 +305,213 @@ const FileLoader = (() => {
     return [r, g, b];
   }
 
+  /* ── Converte cor hex #rrggbb → {r,g,b} ── */
+  function _hexToRgb(hex) {
+    hex = (hex || '#808080').replace('#', '');
+    if (hex.length === 3) hex = hex.split('').map(c => c + c).join('');
+    return {
+      r: parseInt(hex.slice(0, 2), 16) || 0,
+      g: parseInt(hex.slice(2, 4), 16) || 0,
+      b: parseInt(hex.slice(4, 6), 16) || 0,
+    };
+  }
+
   /* ── Detecta formato do tile pelos magic bytes ── */
   function _tileFormat(data) {
     if (!data || data.length < 4) return 'unknown';
-    /* PNG: 89 50 4E 47 */
     if (data[0] === 0x89 && data[1] === 0x50) return 'image/png';
-    /* JPEG: FF D8 FF */
     if (data[0] === 0xFF && data[1] === 0xD8) return 'image/jpeg';
-    /* WebP: 52 49 46 46 ?? ?? ?? ?? 57 45 42 50 */
     if (data[0] === 0x52 && data[1] === 0x49 && data[8] === 0x57) return 'image/webp';
-    /* TIFF little-endian: 49 49 2A 00 | big-endian: 4D 4D 00 2A */
     if ((data[0] === 0x49 && data[1] === 0x49 && data[2] === 0x2A) ||
         (data[0] === 0x4D && data[1] === 0x4D && data[2] === 0x00)) return 'image/tiff';
     return 'unknown';
   }
 
-  /* ── Decodifica um tile TIFF float32 e pinta no canvas ─────────
-     Usa GeoTIFF.js (CDN). Renderiza com paleta "plasma".
-     Retorna true se bem-sucedido.
+  /* ── Lê o estilo QML salvo pelo QGIS em layer_styles ─────────────
+     Retorna a string QML ou null se a tabela não existir.
   ─────────────────────────────────────────────────────────────── */
-  async function _drawTiffTile(data, ctx, colPx, rowPx, tileW, tileH, minVal, maxVal) {
+  function _readLayerStyle(db, tableName) {
+    try {
+      const res = db.exec(
+        `SELECT styleQML FROM layer_styles
+         WHERE f_table_name='${tableName}'
+         ORDER BY useAsDefault DESC, update_time DESC LIMIT 1`
+      );
+      if (res.length && res[0].values.length && res[0].values[0][0]) {
+        return res[0].values[0][0]; /* QML XML */
+      }
+    } catch (_) { /* layer_styles pode não existir */ }
+    return null;
+  }
+
+  /* ── Parseia o QML do QGIS e extrai a paleta de cores ───────────
+     Suporta:
+       singlebandpseudocolor  → array de stops com value + color
+       singlebandgray         → gradiente preto/branco
+     Retorna um objeto de estilo ou null.
+  ─────────────────────────────────────────────────────────────── */
+  function _parseQmlStyle(qml) {
+    if (!qml || typeof DOMParser === 'undefined') return null;
+    try {
+      const doc      = new DOMParser().parseFromString(qml, 'text/xml');
+      const renderer = doc.querySelector('rasterrenderer');
+      if (!renderer) return null;
+
+      const type    = renderer.getAttribute('type') || '';
+      const nodata  = parseFloat(
+        renderer.getAttribute('noDataValue') ||
+        renderer.getAttribute('nodataValue') ||
+        doc.querySelector('noDataValue')?.textContent || 'NaN'
+      );
+      const opacity = parseFloat(renderer.getAttribute('opacity') || '1');
+
+      /* ── Modo pseudocor (mais comum para NDVI, LST, etc.) ── */
+      if (type === 'singlebandpseudocolor') {
+        const shaderEl = doc.querySelector('colorrampshader');
+        if (!shaderEl) return null;
+
+        const rampType = shaderEl.getAttribute('colorRampType') || 'INTERPOLATED';
+        const stops = Array.from(doc.querySelectorAll('colorrampshader item'))
+          .map(el => ({
+            value: parseFloat(el.getAttribute('value')),
+            color: el.getAttribute('color') || '#808080',
+            alpha: parseInt(el.getAttribute('alpha') || '255'),
+          }))
+          .filter(s => isFinite(s.value))
+          .sort((a, b) => a.value - b.value);
+
+        if (stops.length === 0) return null;
+        console.log(`[GPKG QML] pseudocolor: ${stops.length} stop(s) | rampType: ${rampType} | nodata: ${nodata}`);
+        return { type: 'pseudocolor', rampType, stops, nodata, opacity };
+      }
+
+      /* ── Modo escala de cinza ── */
+      if (type === 'singlebandgray') {
+        const gradient = renderer.getAttribute('gradient') || 'BlackToWhite';
+        const classMin = parseFloat(renderer.getAttribute('classificationMin') || '0');
+        const classMax = parseFloat(renderer.getAttribute('classificationMax') || '1');
+        console.log(`[GPKG QML] gray: ${gradient} | range [${classMin}, ${classMax}]`);
+        return { type: 'gray', gradient, classMin, classMax, nodata, opacity };
+      }
+
+      console.warn(`[GPKG QML] tipo de renderer não suportado: "${type}" — usando plasma`);
+      return null;
+    } catch (e) {
+      console.warn('[GPKG QML] erro ao parsear QML:', e.message);
+      return null;
+    }
+  }
+
+  /* ── Calcula RGBA para um valor dado os stops de cor ─────────────
+     Suporta interpolação linear (INTERPOLATED) e degraus (DISCRETE).
+  ─────────────────────────────────────────────────────────────── */
+  function _colorFromStops(value, stops, rampType) {
+    if (!stops || stops.length === 0) return [128, 128, 128, 255];
+
+    /* Fora do intervalo: usa a cor extrema */
+    if (value <= stops[0].value) {
+      const c = _hexToRgb(stops[0].color);
+      return [c.r, c.g, c.b, stops[0].alpha];
+    }
+    const last = stops[stops.length - 1];
+    if (value >= last.value) {
+      const c = _hexToRgb(last.color);
+      return [c.r, c.g, c.b, last.alpha];
+    }
+
+    if (rampType === 'DISCRETE') {
+      /* Degrau: usa a cor do stop imediatamente anterior */
+      for (let i = stops.length - 1; i >= 0; i--) {
+        if (value >= stops[i].value) {
+          const c = _hexToRgb(stops[i].color);
+          return [c.r, c.g, c.b, stops[i].alpha];
+        }
+      }
+    }
+
+    /* INTERPOLATED (padrão): interpolação linear entre stops adjacentes */
+    for (let i = 0; i < stops.length - 1; i++) {
+      if (value >= stops[i].value && value <= stops[i + 1].value) {
+        const t  = (value - stops[i].value) / (stops[i + 1].value - stops[i].value);
+        const c1 = _hexToRgb(stops[i].color);
+        const c2 = _hexToRgb(stops[i + 1].color);
+        return [
+          Math.round(c1.r + (c2.r - c1.r) * t),
+          Math.round(c1.g + (c2.g - c1.g) * t),
+          Math.round(c1.b + (c2.b - c1.b) * t),
+          Math.round(stops[i].alpha + (stops[i + 1].alpha - stops[i].alpha) * t),
+        ];
+      }
+    }
+
+    const c = _hexToRgb(last.color);
+    return [c.r, c.g, c.b, last.alpha];
+  }
+
+  /* ── Decodifica tile TIFF float32 e pinta no canvas ─────────────
+     Usa GeoTIFF.js. Aplica o estilo QML do QGIS (qmlStyle) se
+     disponível, senão usa a paleta plasma como fallback.
+  ─────────────────────────────────────────────────────────────── */
+  async function _drawTiffTile(data, ctx, colPx, rowPx, tileW, tileH, minVal, maxVal, qmlStyle) {
     if (typeof GeoTIFF === 'undefined') {
       console.warn('[GPKG TIFF] GeoTIFF.js não disponível');
       return false;
     }
     try {
-      /* GeoTIFF.js lê o ArrayBuffer do tile TIFF */
-      const buf  = data.buffer.slice(data.byteOffset, data.byteOffset + data.byteLength);
-      const tiff = await GeoTIFF.fromArrayBuffer(buf);
-      const img  = await tiff.getImage();
-      const rasters = await img.readRasters();
+      const buf     = data.buffer.slice(data.byteOffset, data.byteOffset + data.byteLength);
+      const tiff    = await GeoTIFF.fromArrayBuffer(buf);
+      const image   = await tiff.getImage();
+      const rasters = await image.readRasters();
 
-      const band  = rasters[0];
-      const w     = img.getWidth();
-      const h     = img.getHeight();
-      const range = maxVal - minVal || 1;
+      const band    = rasters[0];
+      const w       = image.getWidth();
+      const h       = image.getHeight();
+      const range   = maxVal - minVal || 1;
 
-      /* Cria ImageData e aplica paleta plasma */
+      /* Nodata: NaN/Inf do float32 E o nodata configurado no QGIS */
+      const qmlNodata = qmlStyle ? qmlStyle.nodata : NaN;
+
       const imgData = ctx.createImageData(w, h);
+
       for (let i = 0; i < band.length; i++) {
         const v = band[i];
-        /* Trata NaN / NoData como transparente */
-        if (!isFinite(v)) {
-          imgData.data[i * 4 + 3] = 0;
+        const px = i * 4;
+
+        /* Transparente se nodata */
+        if (!isFinite(v) || (!isNaN(qmlNodata) && Math.abs(v - qmlNodata) < 1e-6)) {
+          imgData.data[px + 3] = 0;
           continue;
         }
-        const t = Math.max(0, Math.min(1, (v - minVal) / range));
-        const [r, g, b] = _plasmaColor(t);
-        imgData.data[i * 4]     = r;
-        imgData.data[i * 4 + 1] = g;
-        imgData.data[i * 4 + 2] = b;
-        imgData.data[i * 4 + 3] = 210; /* levemente transparente */
+
+        let r, g, b, a = 220;
+
+        if (qmlStyle && qmlStyle.type === 'pseudocolor') {
+          /* ── Cores exatamente como o QGIS configurou ── */
+          const [cr, cg, cb, ca] = _colorFromStops(v, qmlStyle.stops, qmlStyle.rampType);
+          r = cr; g = cg; b = cb;
+          a = Math.round(ca * qmlStyle.opacity);
+
+        } else if (qmlStyle && qmlStyle.type === 'gray') {
+          /* ── Escala de cinza com range do QGIS ── */
+          const t  = Math.max(0, Math.min(1, (v - qmlStyle.classMin) / (qmlStyle.classMax - qmlStyle.classMin || 1)));
+          const gv = Math.round((qmlStyle.gradient === 'WhiteToBlack' ? 1 - t : t) * 255);
+          r = g = b = gv;
+          a = Math.round(220 * qmlStyle.opacity);
+
+        } else {
+          /* ── Fallback: plasma com min/max automático ── */
+          const t  = Math.max(0, Math.min(1, (v - minVal) / range));
+          [r, g, b] = _plasmaColor(t);
+        }
+
+        imgData.data[px]     = r;
+        imgData.data[px + 1] = g;
+        imgData.data[px + 2] = b;
+        imgData.data[px + 3] = a;
       }
 
-      /* Desenha numa sub-canvas e copia para o canvas principal */
-      const tmp  = document.createElement('canvas');
-      tmp.width  = w;
-      tmp.height = h;
+      const tmp = document.createElement('canvas');
+      tmp.width = w; tmp.height = h;
       tmp.getContext('2d').putImageData(imgData, 0, 0);
       ctx.drawImage(tmp, colPx, rowPx);
       return true;
@@ -499,45 +647,65 @@ const FileLoader = (() => {
     canvas.height = canvasH;
     const ctx = canvas.getContext('2d');
 
+    /* ── Lê o estilo do QGIS (tabela layer_styles dentro do .gpkg) ── */
+    const qmlRaw   = _readLayerStyle(db, tableName);
+    const qmlStyle = qmlRaw ? _parseQmlStyle(qmlRaw) : null;
+    if (qmlStyle) {
+      console.log(`[GPKG Raster] "${tableName}": estilo QGIS aplicado (${qmlStyle.type})`);
+    } else {
+      console.log(`[GPKG Raster] "${tableName}": sem estilo QGIS — usando paleta plasma`);
+    }
+
     let drawn = 0;
 
     if (format === 'image/tiff') {
-      /* ── TIFF float32: dois passos ─────────────────────────────
-         Passo 1: varre todos os tiles para encontrar min/max global
-         Passo 2: renderiza com escala de cores consistente         */
+      /* ── TIFF float32 ─────────────────────────────────────────
+         Se há estilo QML com stops em valores reais, usa diretamente.
+         Se não, faz scan min/max para normalizar na paleta plasma.
+      ──────────────────────────────────────────────────────────── */
       console.log(`[GPKG Raster] "${tableName}": decodificando TIFF float32 com GeoTIFF.js...`);
 
       let globalMin = Infinity, globalMax = -Infinity;
 
-      /* Passo 1 — scan de min/max */
-      for (const [,, rawData] of tileRows) {
-        if (!rawData) continue;
-        try {
-          const bytes = rawData instanceof Uint8Array ? rawData : new Uint8Array(rawData);
-          const buf   = bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength);
-          const tiff  = await GeoTIFF.fromArrayBuffer(buf);
-          const img   = await tiff.getImage();
-          const rasters = await img.readRasters();
-          for (const v of rasters[0]) {
-            if (isFinite(v)) {
-              if (v < globalMin) globalMin = v;
-              if (v > globalMax) globalMax = v;
+      /* Quando o QML tem stops com valores reais, já temos os limites.
+         Quando não tem (fallback plasma), precisamos escanear os tiles. */
+      const needsScan = !qmlStyle || qmlStyle.type !== 'pseudocolor';
+
+      if (needsScan) {
+        for (const [,, rawData] of tileRows) {
+          if (!rawData) continue;
+          try {
+            const bytes = rawData instanceof Uint8Array ? rawData : new Uint8Array(rawData);
+            const buf   = bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength);
+            const tiff  = await GeoTIFF.fromArrayBuffer(buf);
+            const img   = await tiff.getImage();
+            const rasters = await img.readRasters();
+            const nodata  = qmlStyle?.nodata;
+            for (const v of rasters[0]) {
+              if (isFinite(v) && (isNaN(nodata) || Math.abs(v - nodata) > 1e-6)) {
+                if (v < globalMin) globalMin = v;
+                if (v > globalMax) globalMax = v;
+              }
             }
-          }
-        } catch (_) {}
+          } catch (_) {}
+        }
+        if (!isFinite(globalMin) || globalMin === globalMax) { globalMin = 0; globalMax = 1; }
+        console.log(`[GPKG Raster] "${tableName}": min=${globalMin.toFixed(4)} max=${globalMax.toFixed(4)}`);
+      } else {
+        /* Usa os valores mínimo/máximo dos próprios stops do QML */
+        globalMin = qmlStyle.stops[0].value;
+        globalMax = qmlStyle.stops[qmlStyle.stops.length - 1].value;
+        console.log(`[GPKG Raster] "${tableName}": range do QML [${globalMin.toFixed(4)}, ${globalMax.toFixed(4)}]`);
       }
 
-      if (!isFinite(globalMin) || globalMin === globalMax) {
-        globalMin = 0; globalMax = 1;
-      }
-      console.log(`[GPKG Raster] "${tableName}": min=${globalMin.toFixed(4)} max=${globalMax.toFixed(4)}`);
-
-      /* Passo 2 — render */
+      /* Render de todos os tiles */
       for (const [col, row, rawData] of tileRows) {
         if (!rawData) continue;
         const bytes = rawData instanceof Uint8Array ? rawData : new Uint8Array(rawData);
-        const ok = await _drawTiffTile(bytes, ctx, col * best.tileW, row * best.tileH,
-                                       best.tileW, best.tileH, globalMin, globalMax);
+        const ok = await _drawTiffTile(
+          bytes, ctx, col * best.tileW, row * best.tileH,
+          best.tileW, best.tileH, globalMin, globalMax, qmlStyle
+        );
         if (ok) drawn++;
       }
 
