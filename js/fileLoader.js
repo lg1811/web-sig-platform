@@ -283,6 +283,172 @@ const FileLoader = (() => {
     return -1;
   }
 
+  /* ── GeoPackage Raster Tile Loader ─────────────────────────────
+     Lê camadas de tiles (raster) de um GeoPackage.
+     Cada camada tile é uma tabela com colunas:
+       zoom_level | tile_column | tile_row | tile_data (PNG/JPEG blob)
+     Assembla os tiles em um <canvas> e exibe como L.imageOverlay.
+  ─────────────────────────────────────────────────────────────── */
+  async function _loadGpkgRasterLayer(db, tableName, layerLabel) {
+    console.log(`[GPKG Raster] Processando: "${tableName}"`);
+
+    /* 1. Lê extensão geográfica e SRS da camada */
+    let minX, minY, maxX, maxY, srsId;
+    try {
+      const r = db.exec(`SELECT min_x, min_y, max_x, max_y, srs_id
+                         FROM gpkg_tile_matrix_set WHERE table_name='${tableName}'`);
+      if (!r.length || !r[0].values.length) throw new Error('sem dados em gpkg_tile_matrix_set');
+      [minX, minY, maxX, maxY, srsId] = r[0].values[0];
+      console.log(`[GPKG Raster] "${tableName}": extent=[${minX},${minY},${maxX},${maxY}] SRS=${srsId}`);
+    } catch (e) {
+      console.warn(`[GPKG Raster] "${tableName}": erro no tile_matrix_set:`, e.message);
+      return false;
+    }
+
+    /* 2. Lê os níveis de zoom disponíveis */
+    let zoomLevels = [];
+    try {
+      const r = db.exec(`SELECT zoom_level, matrix_width, matrix_height, tile_width, tile_height
+                         FROM gpkg_tile_matrix WHERE table_name='${tableName}'
+                         ORDER BY zoom_level ASC`);
+      if (!r.length || !r[0].values.length) throw new Error('sem dados em gpkg_tile_matrix');
+      zoomLevels = r[0].values.map(v => ({
+        zoom: v[0], matrixW: v[1], matrixH: v[2], tileW: v[3], tileH: v[4]
+      }));
+      console.log(`[GPKG Raster] "${tableName}": ${zoomLevels.length} zoom(s):`, zoomLevels.map(z => z.zoom));
+    } catch (e) {
+      console.warn(`[GPKG Raster] "${tableName}": erro no tile_matrix:`, e.message);
+      return false;
+    }
+
+    /* 3. Escolhe o zoom mais detalhado com ≤ 400 tiles totais
+          para não explodir a memória com rasters enormes */
+    let best = zoomLevels[0];
+    for (const z of zoomLevels) {
+      const total = z.matrixW * z.matrixH;
+      if (total <= 400) best = z;
+    }
+
+    /* Verifica quantos tiles existem DE FATO no banco no zoom escolhido */
+    let tileRows = [];
+    try {
+      const r = db.exec(`SELECT tile_column, tile_row, tile_data
+                         FROM "${tableName}" WHERE zoom_level=${best.zoom}`);
+      if (r.length && r[0].values.length) tileRows = r[0].values;
+      console.log(`[GPKG Raster] "${tableName}": zoom ${best.zoom} → ${tileRows.length} tile(s) no banco`);
+    } catch (e) {
+      console.warn(`[GPKG Raster] "${tableName}": erro ao ler tiles:`, e.message);
+      return false;
+    }
+
+    if (tileRows.length === 0) {
+      /* Tenta o maior zoom disponível */
+      for (let zi = zoomLevels.length - 1; zi >= 0; zi--) {
+        try {
+          const z = zoomLevels[zi];
+          const r = db.exec(`SELECT tile_column, tile_row, tile_data
+                             FROM "${tableName}" WHERE zoom_level=${z.zoom} LIMIT 500`);
+          if (r.length && r[0].values.length) {
+            best = z;
+            tileRows = r[0].values;
+            console.log(`[GPKG Raster] "${tableName}": fallback zoom ${z.zoom} → ${tileRows.length} tile(s)`);
+            break;
+          }
+        } catch (_) {}
+      }
+    }
+
+    if (tileRows.length === 0) {
+      console.warn(`[GPKG Raster] "${tableName}": nenhum tile encontrado`);
+      return false;
+    }
+
+    /* 4. Assembla os tiles em um <canvas> */
+    const canvasW = best.matrixW * best.tileW;
+    const canvasH = best.matrixH * best.tileH;
+
+    /* Limite de segurança de canvas */
+    if (canvasW > 16384 || canvasH > 16384) {
+      console.warn(`[GPKG Raster] "${tableName}": canvas muito grande (${canvasW}×${canvasH}), pulando.`);
+      return false;
+    }
+
+    console.log(`[GPKG Raster] "${tableName}": canvas ${canvasW}×${canvasH}px`);
+
+    const canvas = document.createElement('canvas');
+    canvas.width  = canvasW;
+    canvas.height = canvasH;
+    const ctx = canvas.getContext('2d');
+
+    let drawn = 0;
+    await Promise.all(tileRows.map(([col, row, data]) => new Promise(resolve => {
+      if (!data) { resolve(); return; }
+
+      const blob = new Blob([data instanceof Uint8Array ? data : new Uint8Array(data)]);
+      const url  = URL.createObjectURL(blob);
+      const img  = new Image();
+
+      img.onload = () => {
+        /* GeoPackage spec: tile_row=0 é o canto SUPERIOR-ESQUERDO (norte).
+           Alguns softwares (QGIS, GDAL) invertem (TMS: row=0 = sul).
+           Tentamos primeiro com o modo padrão (sem inversão).
+           Se aparecer de cabeça para baixo, o problema é convenção TMS. */
+        ctx.drawImage(img, col * best.tileW, row * best.tileH);
+        URL.revokeObjectURL(url);
+        drawn++;
+        resolve();
+      };
+      img.onerror = () => { URL.revokeObjectURL(url); resolve(); };
+      img.src = url;
+    })));
+
+    if (drawn === 0) {
+      console.warn(`[GPKG Raster] "${tableName}": nenhum tile desenhado`);
+      return false;
+    }
+    console.log(`[GPKG Raster] "${tableName}": ${drawn} tile(s) desenhados`);
+
+    /* 5. Converte extensão para WGS84 lat/lng */
+    let bounds;
+
+    if (srsId === 4326) {
+      /* Já em graus — direto */
+      bounds = [[minY, minX], [maxY, maxX]];
+
+    } else if (srsId === 3857 || srsId === 900913) {
+      /* Web Mercator → WGS84 */
+      const m2ll = (mx, my) => {
+        const lng = mx / 20037508.34 * 180;
+        const lat = Math.atan(Math.exp(my * Math.PI / 20037508.34)) * 360 / Math.PI - 90;
+        return [lat, lng];
+      };
+      bounds = [m2ll(minX, minY), m2ll(maxX, maxY)];
+
+    } else if (typeof proj4 !== 'undefined') {
+      /* Tenta reprojetar com proj4 usando EPSG */
+      try {
+        const sw = proj4(`EPSG:${srsId}`, 'WGS84', [minX, minY]);
+        const ne = proj4(`EPSG:${srsId}`, 'WGS84', [maxX, maxY]);
+        bounds = [[sw[1], sw[0]], [ne[1], ne[0]]];
+        console.log(`[GPKG Raster] "${tableName}": reprojetado de EPSG:${srsId}`);
+      } catch (e) {
+        console.warn(`[GPKG Raster] "${tableName}": reprojeção de EPSG:${srsId} falhou:`, e.message);
+        return false;
+      }
+
+    } else {
+      console.warn(`[GPKG Raster] "${tableName}": SRS ${srsId} não suportado`);
+      return false;
+    }
+
+    console.log(`[GPKG Raster] "${tableName}": bounds WGS84:`, bounds);
+
+    /* 6. Exporta canvas como PNG e adiciona ao mapa */
+    const dataUrl = canvas.toDataURL('image/png');
+    LayerManager.addImageOverlayLayer(dataUrl, layerLabel, bounds);
+    return true;
+  }
+
   /* ── GeoPackage Loader principal ── */
   async function loadGeoPackage(file) {
     if (typeof initSqlJs === 'undefined') {
@@ -467,28 +633,78 @@ const FileLoader = (() => {
       }
     }
 
+    /* ── 5. Camadas RASTER (tiles e gridded coverage) ──────────
+       Busca em gpkg_contents as camadas que NÃO são vetoriais.
+       O db ainda está aberto neste ponto para que possamos ler os tiles. */
+    setProgress(fill, lbl, 88, 'Verificando camadas raster...');
+
+    let rasterTables = [];
+    try {
+      const rRes = db.exec(
+        "SELECT table_name, identifier, data_type FROM gpkg_contents WHERE data_type IN ('tiles','2d-gridded-coverage')"
+      );
+      if (rRes.length && rRes[0].values.length) {
+        rasterTables = rRes[0].values.map(row => ({
+          tableName: row[0],
+          label:     row[1] || row[0],
+          dataType:  row[2],
+        }));
+        console.log(`[GPKG] ${rasterTables.length} camada(s) raster encontrada(s):`,
+          rasterTables.map(t => t.tableName));
+      }
+    } catch (e) {
+      console.warn('[GPKG] Erro ao buscar camadas raster:', e.message);
+    }
+
+    let rastersAdded = 0;
+    for (let ri = 0; ri < rasterTables.length; ri++) {
+      const { tableName, label } = rasterTables[ri];
+      const layerLabel = rasterTables.length === 1 && featureTables.length === 0
+        ? gpkgName
+        : `${gpkgName} · ${label}`;
+
+      setProgress(fill, lbl, 88 + Math.round(((ri + 1) / Math.max(rasterTables.length, 1)) * 10),
+        `Raster ${ri + 1}/${rasterTables.length}: ${label}...`);
+
+      try {
+        const ok = await _loadGpkgRasterLayer(db, tableName, layerLabel);
+        if (ok) {
+          rastersAdded++;
+          console.log(`[GPKG] ✓ Raster "${tableName}" adicionado`);
+        } else {
+          skipped.push(`${tableName} (raster): falha no carregamento`);
+        }
+      } catch (e) {
+        console.error(`[GPKG] Erro raster "${tableName}":`, e);
+        skipped.push(`${tableName} (raster): ${e.message}`);
+      }
+    }
+
+    /* ── Fecha o banco após processar tudo ── */
     db.close();
-    setProgress(fill, lbl, 100, `${totalFeatures.toLocaleString('pt-BR')} feições carregadas!`);
+    setProgress(fill, lbl, 100, 'Concluído!');
     hideProgress(prog);
 
     /* Avisos de camadas ignoradas */
     if (skipped.length > 0) {
       console.warn('[GPKG] Camadas ignoradas:', skipped);
       showToast(
-        `${skipped.length} camada(s) ignorada(s). Veja o console (F12).`,
+        `${skipped.length} camada(s) ignorada(s). Abra o Console (F12).`,
         'warning', 5000
       );
     }
 
-    if (layersAdded === 0) {
-      throw new Error('Nenhuma feição válida encontrada no GeoPackage.');
+    const totalLayers = layersAdded + rastersAdded;
+    if (totalLayers === 0) {
+      throw new Error('Nenhuma camada válida encontrada no GeoPackage.');
     }
 
     LayerManager.zoomToAll();
-    showToast(
-      `GeoPackage: ${layersAdded} de ${featureTables.length} camada(s) · ${totalFeatures.toLocaleString('pt-BR')} feições`,
-      'success', 6000
-    );
+
+    const parts = [];
+    if (layersAdded  > 0) parts.push(`${layersAdded} vetorial(is) · ${totalFeatures.toLocaleString('pt-BR')} feições`);
+    if (rastersAdded > 0) parts.push(`${rastersAdded} raster(s)`);
+    showToast(`GeoPackage: ${parts.join(' + ')}`, 'success', 7000);
   }
 
   /* ============================================================

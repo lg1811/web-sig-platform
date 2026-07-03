@@ -288,7 +288,32 @@ const LayerManager = (() => {
     document.getElementById('layer-empty-msg')?.remove();
   }
 
-  return { addGeoJSONLayer, addGeoTIFFLayer, removeLayer, toggleLayer, zoomToLayer, zoomToAll, clearAll, getLayers };
+  /* ── Add Image Overlay layer (GeoPackage raster tiles) ── */
+  function addImageOverlayLayer(dataUrl, name, leafletBounds) {
+    const id    = ++_idCounter;
+    const color = nextColor();
+
+    const leafletLayer = L.imageOverlay(dataUrl, leafletBounds, {
+      opacity:     0.85,
+      interactive: false,
+    });
+    leafletLayer.addTo(AppState.map);
+
+    try {
+      AppState.map.fitBounds(leafletBounds, { padding: [30, 30] });
+    } catch (_) {}
+
+    const entry = { id, name, color, type: 'Raster', leafletLayer, visible: true, source: 'upload' };
+    _layers.push(entry);
+
+    renderLayerItem(entry);
+    updateLayerCount(_layers.length);
+    _hideEmptyMsg();
+
+    return entry;
+  }
+
+  return { addGeoJSONLayer, addGeoTIFFLayer, addImageOverlayLayer, removeLayer, toggleLayer, zoomToLayer, zoomToAll, clearAll, getLayers };
 })();
 
 /* ============================================================
